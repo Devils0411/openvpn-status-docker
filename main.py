@@ -11,6 +11,7 @@ import psutil
 import socket
 import subprocess
 import json
+import logging
 
 from statistics import mean
 from threading import Lock
@@ -72,6 +73,9 @@ app.config.from_object(Config)
 
 # Применяем middleware для обработки префикса пути
 app.wsgi_app = ScriptNameMiddleware(app.wsgi_app)
+
+DOCKER_HUB_REPO = "devils0411/openvpn-status"  # Укажите ваш namespace/repo
+DOCKER_HUB_API = f"https://hub.docker.com/v2/repositories/{DOCKER_HUB_REPO}/tags/"
 
 bcrypt = Bcrypt(app)
 loginManager = LoginManager(app)
@@ -161,7 +165,7 @@ def update_env_values(updates):
 
 
 DEFAULT_SETTINGS = {
-    "app_name": "StatusOpenVPN",
+    "app_name": "OpenVPN-Status",
     "telegram_admins": {},
     "bot_enabled": False,
 }
@@ -1430,28 +1434,66 @@ def login():
     return resp
 
 
-def get_git_version():
+#def get_git_version():
+#    try:
+#        version = (
+#            subprocess.check_output(
+#                ["/usr/bin/git", "describe", "--tags", "--abbrev=0"],
+#                stderr=subprocess.DEVNULL,
+#            )
+#            .strip()
+#            .decode()
+#        )
+#    except (subprocess.CalledProcessError, FileNotFoundError):
+#        version = "unknown"
+#    return version
+
+def get_docker_hub_version():
+    """
+    Получает последний семантический тег из Docker Hub.
+    Результат кэшируется на cache_ttl_minutes минут через lru_cache.
+    Для сброса кэша: get_docker_hub_version.cache_clear()
+    """
     try:
-        version = (
-            subprocess.check_output(
-                ["/usr/bin/git", "describe", "--tags", "--abbrev=0"],
-                stderr=subprocess.DEVNULL,
-            )
-            .strip()
-            .decode()
+        # Запрашиваем теги с сортировкой по дате (последние сначала)
+        response = requests.get(
+            DOCKER_HUB_API,
+            params={"page_size": 100, "ordering": "-last_updated"},
+            timeout=10
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        version = "unknown"
-    return version
+        response.raise_for_status()
+        data = response.json()
+        
+        tags = [t["name"] for t in data.get("results", []) if t.get("name")]
+        
+        # Фильтруем теги: оставляем только семантические версии (vX.Y.Z или X.Y.Z)
+        import re
+        semver_pattern = re.compile(r'^v?\d+\.\d+\.\d+$')
+        version_tags = [t for t in tags if semver_pattern.match(t)]
+        
+        if version_tags:
+            # Возвращаем первый (самый новый) тег
+            return version_tags[0]
+        
+        # fallback: если нет semver-тегов, возвращаем первый непустой тег
+        return tags[0] if tags else "unknown"
+        
+    except requests.RequestException as e:
+        logging.warning(f"Failed to fetch version from Docker Hub: {e}")
+        return "unknown"
+    except Exception as e:
+        logging.error(f"Unexpected error fetching Docker Hub version: {e}")
+        return "unknown"
 
 
 @app.context_processor
 def inject_info():
-    app_name = read_settings().get("app_name", "StatusOpenVPN")
+    app_name = read_settings().get("app_name", "OpenVPN-Status")
     return {
         "hostname": socket.gethostname(),
         "server_ip": get_external_ip(),
-        "version": get_git_version(),
+#        "version": get_git_version(),
+        "version": get_docker_hub_version(),
         "base_path": request.script_root or "",
         "app_name": app_name,
     }

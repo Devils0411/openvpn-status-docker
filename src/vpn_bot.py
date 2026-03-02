@@ -253,7 +253,6 @@ def get_client_mapping():
     mapping = {}
     if not raw_value:
         return mapping
-    
     try:
         for item in raw_value.split(","):
             item = item.strip()
@@ -264,38 +263,107 @@ def get_client_mapping():
             client_name = client_name.strip()
             if not telegram_id or not client_name:
                 continue
-            mapping[telegram_id] = client_name
+            
+            # Если такой ID уже есть, добавляем профиль в список, иначе создаем новый
+            if telegram_id in mapping:
+                if isinstance(mapping[telegram_id], list):
+                    mapping[telegram_id].append(client_name)
+                else:
+                    mapping[telegram_id] = [mapping[telegram_id], client_name]
+            else:
+                mapping[telegram_id] = [client_name]
     except Exception as e:
         logger.error(f"Ошибка парсинга CLIENT_MAPPING: {e}")
-    
+
     return mapping
 
 
 def get_client_name_for_user(user_id: int):
-    return get_client_mapping().get(str(user_id))
+    profiles = get_client_mapping().get(str(user_id), [])
+    if isinstance(profiles, list):
+        return profiles[0] if profiles else None  # Возвращаем первый для совместимости
+    return profiles
 
 
 def set_client_mapping(telegram_id: str, client_name: str):
     try:
         client_map = get_client_mapping()
-        client_map[str(telegram_id)] = client_name
-        serialized = ",".join([f"{key}:{value}" for key, value in client_map.items()])
+        telegram_id = str(telegram_id)
+        
+        # Проверяем, есть ли уже такой профиль у этого пользователя
+        existing_profiles = client_map.get(telegram_id, [])
+        if not isinstance(existing_profiles, list):
+            existing_profiles = [existing_profiles] if existing_profiles else []
+            
+        if client_name in existing_profiles:
+            logger.info(f"Привязка уже существует: {telegram_id} → {client_name}")
+            return False  # Привязка уже есть, ничего не делаем
+
+        # Добавляем новый профиль
+        existing_profiles.append(client_name)
+        client_map[telegram_id] = existing_profiles
+        
+        # Сериализуем обратно в строку: id:prof1,id:prof2,id:prof3
+        serialized_items = []
+        for tid, profiles in client_map.items():
+            if isinstance(profiles, list):
+                for prof in profiles:
+                    serialized_items.append(f"{tid}:{prof}")
+            else:
+                serialized_items.append(f"{tid}:{profiles}")
+        
+        serialized = ",".join(serialized_items)
         update_env_values({CLIENT_MAPPING_KEY: serialized})
-        logger.info(f"Привязка клиента: {telegram_id} → {client_name}")
+        logger.info(f"Добавлена привязка клиента: {telegram_id} → {client_name}")
+        return True
     except Exception as e:
         logger.error(f"Ошибка установки привязки клиента: {e}")
+        return False
 
 
-def remove_client_mapping(telegram_id: str):
+def remove_client_mapping(telegram_id: str, client_name: str = None):
     try:
         client_map = get_client_mapping()
-        if str(telegram_id) in client_map:
-            client_map.pop(str(telegram_id), None)
-            serialized = ",".join([f"{key}:{value}" for key, value in client_map.items()])
-            update_env_values({CLIENT_MAPPING_KEY: serialized})
-            logger.info(f"Удалена привязка клиента: {telegram_id}")
+        telegram_id = str(telegram_id)
+        
+        if telegram_id not in client_map:
+            return False
+            
+        existing_profiles = client_map[telegram_id]
+        if not isinstance(existing_profiles, list):
+            existing_profiles = [existing_profiles]
+        
+        if client_name:
+            # Удаляем конкретный профиль
+            if client_name in existing_profiles:
+                existing_profiles.remove(client_name)
+            else:
+                return False
+        else:
+            # Если профиль не указан, удаляем все привязки пользователя
+            existing_profiles = []
+        
+        if existing_profiles:
+            client_map[telegram_id] = existing_profiles
+        else:
+            client_map.pop(telegram_id, None)
+        
+        # Сериализуем обратно
+        serialized_items = []
+        for tid, profiles in client_map.items():
+            if isinstance(profiles, list):
+                for prof in profiles:
+                    serialized_items.append(f"{tid}:{prof}")
+            else:
+                serialized_items.append(f"{tid}:{profiles}")
+        
+        serialized = ",".join(serialized_items) if serialized_items else ""
+        update_env_values({CLIENT_MAPPING_KEY: serialized})
+        logger.info(f"Удалена привязка клиента: {telegram_id} → {client_name or 'все'}")
+        return True
     except Exception as e:
         logger.error(f"Ошибка удаления привязки клиента: {e}")
+        return False
 
 
 def is_admin_notification_enabled(user_id: int) -> bool:
@@ -422,6 +490,8 @@ class VPNSetup(StatesGroup):
     entering_client_mapping = State()
     entering_cpu_threshold = State()
     entering_memory_threshold = State()
+    waiting_for_user_contact = State()  # Новое состояние: ожидание контакта
+    selecting_profile_for_mapping = State()  # Новое состояние: выбор профиля
 
 
 # ============================================================================
@@ -752,28 +822,63 @@ def get_user_label(telegram_id: str) -> str:
 def create_clients_menu():
     client_map = get_client_mapping()
     buttons = []
+    
     if client_map:
-        for telegram_id, client_name in client_map.items():
-            label = f"{get_user_label(telegram_id)}:{client_name}"
-            buttons.append(
-                [
+        for telegram_id, profiles in client_map.items():
+            if not isinstance(profiles, list):
+                profiles = [profiles]
+            
+            # Создаем кнопку для каждого профиля отдельно
+            for profile in profiles:
+                label = f"{get_user_label(telegram_id)}:{profile}"
+                # В callback_data добавляем профиль для точного удаления
+                buttons.append([
                     InlineKeyboardButton(
-                        text=label,
-                        callback_data=f"clientmap_{telegram_id}",
+                        text=label, 
+                        callback_data=f"clientmap_{telegram_id}_{profile}"
                     )
-                ]
-            )
+                ])
     else:
         buttons.append(
             [InlineKeyboardButton(text="Привязок нет", callback_data="no_action")]
         )
+    
+    buttons.append([
+        InlineKeyboardButton(text="👤 Выбрать пользователя", callback_data="clientmap_select_user")
+    ])
+    
     buttons.append(
-        [InlineKeyboardButton(text="➕ Добавить", callback_data="clientmap_add")]
+        [InlineKeyboardButton(text="➕ Добавить вручную", callback_data="clientmap_add")]
     )
+    
     buttons.append(
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
     )
+    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_contact_request_keyboard():
+    """Создает клавиатуру с кнопкой запроса контакта."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📱 Отправить контакт",
+                    switch_inline_query="",  # Альтернатива: использовать request_contact в ReplyKeyboard
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📨 Переслать сообщение от пользователя",
+                    callback_data="clientmap_forward_info"
+                )
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="clients_menu")
+            ]
+        ]
+    )
 
 
 def create_admins_menu():
@@ -1047,7 +1152,7 @@ async def handle_client_mapping_state(message: types.Message, state: FSMContext)
 
 async def process_client_mapping(message: types.Message, raw_text: str, state: FSMContext):
     payload = raw_text.strip()
-    match = re.match(r"^(\d+)\s*:\s*([a-zA-Z0-9_-]{1,32})$", payload)
+    match = re.match(r"^(\d+)\s*:\s*([a-zA-Z0-9_.-]{1,32})$", payload)
     if not match:
         await message.answer(
             "❌ Некорректный формат. Используйте:\n"
@@ -1138,11 +1243,28 @@ async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMCont
         return
     
     data = callback.data
-    
+
     if data in ["wireguard_menu", "7", "8"]:
         await callback.answer("⛔ Эта функция отключена", show_alert=True)
         return
-    
+
+    if data == "clientmap_select_user":
+        await callback.message.edit_text(
+            "👤 <b>Привязка профиля к пользователю</b>\n\n"
+            "Чтобы получить ID пользователя:\n"
+            "1️⃣ Попросите пользователя написать боту /start\n"
+            "2️⃣ <b>Перешлите</b> любое сообщение от этого пользователя сюда\n\n"
+            "<i>Бот автоматически считает ID из пересланного сообщения</i>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="clients_menu")]
+                ]
+            ),
+        )
+        await state.set_state(VPNSetup.waiting_for_user_contact)
+        await callback.answer()
+        return
+
     if data == "clientmap_add":
         await callback.message.edit_text(
             "Отправьте привязку в формате:\n"
@@ -1159,27 +1281,167 @@ async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMCont
         return
 
     if data.startswith("clientmap_delete_confirm_"):
-        telegram_id = data.split("_")[-1]
-        remove_client_mapping(telegram_id)
-        await callback.message.edit_text("Привязка удалена.", reply_markup=create_clients_menu())
+        # Формат: clientmap_delete_confirm_ID_PROFILE
+        parts = data.replace("clientmap_delete_confirm_", "").split("_", 1)
+        if len(parts) == 2:
+            telegram_id, profile = parts
+            remove_client_mapping(telegram_id, profile)
+            await callback.message.edit_text("Привязка удалена.", reply_markup=create_clients_menu())
         await callback.answer()
         return
 
     if data.startswith("clientmap_"):
-        telegram_id = data.split("_", 1)[1]
-        client_map = get_client_mapping()
-        client_name = client_map.get(telegram_id)
-        if not client_name:
-            await callback.message.edit_text("Привязка не найдена.", reply_markup=create_clients_menu())
-            await callback.answer()
-            return
-        await callback.message.edit_text(
-            f"Удалить привязку <code>{get_user_label(telegram_id)}</code> → "
-            f"<b>{client_name}</b>?",
-            reply_markup=create_clientmap_delete_menu(telegram_id, client_name),
-        )
+        # Формат: clientmap_ID_PROFILE
+        parts = data.replace("clientmap_", "").split("_", 1)
+        if len(parts) == 2:
+            telegram_id, profile = parts
+            await callback.message.edit_text(
+                f"Удалить привязку <code>{get_user_label(telegram_id)}</code> → "
+                f"<b>{profile}</b>?",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="✅ Удалить",
+                                callback_data=f"clientmap_delete_confirm_{telegram_id}_{profile}"
+                            )
+                        ],
+                        [InlineKeyboardButton(text="❌ Отмена", callback_data="clients_menu")]
+                    ]
+                ),
+            )
         await callback.answer()
         return
+
+
+@dp.message(VPNSetup.waiting_for_user_contact)
+async def handle_user_contact(message: types.Message, state: FSMContext):
+    """Обрабатывает пересланное сообщение для получения ID пользователя."""
+    if message.from_user.id not in ADMIN_ID:
+        await message.answer("Доступ запрещен")
+        await state.clear()
+        return
+
+    # Проверяем, есть ли пересланное сообщение
+    if message.forward_from:
+        user_id = message.forward_from.id
+        first_name = message.forward_from.first_name or ""
+        last_name = message.forward_from.last_name or ""
+        username = message.forward_from.username or ""
+        
+        full_name = " ".join([first_name, last_name]).strip()
+        user_display = full_name if full_name else f"@{username}" if username else f"ID: {user_id}"
+        
+        # Сохраняем ID в состоянии
+        await state.update_data(
+            target_user_id=str(user_id),
+            target_user_name=user_display
+        )
+        
+        # Получаем список OpenVPN клиентов
+        clients = await get_clients("openvpn")
+        
+        if not clients:
+            await message.answer(
+                "❌ <b>Нет доступных профилей OpenVPN</b>\n\n"
+                "Сначала создайте клиентов OpenVPN.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="clients_menu")]
+                    ]
+                )
+            )
+            await state.clear()
+            return
+        
+        # Формируем меню выбора профиля
+        buttons = []
+        for client in clients:
+            if isinstance(client, dict):
+                client_name = client.get("name", str(client))
+                expire_date = client.get("expire")
+                
+                # Формируем текст кнопки с информацией о сроке действия
+                if expire_date and expire_date != "unknown":
+                    button_text = f"👤 {client_name} (до {expire_date})"
+                else:
+                    button_text = f"👤 {client_name}"
+            else:
+                client_name = str(client)
+                button_text = f"👤 {client_name}"
+            
+            buttons.append([
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=f"map_profile_{client_name}"
+                )
+            ])
+        
+        buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="clients_menu")])
+        
+        await message.answer(
+            f"✅ <b>Пользователь выбран:</b>\n"
+            f"👤 {user_display}\n"
+            f"🔢 ID: <code>{user_id}</code>\n\n"
+            f"<b>Выберите профиль OpenVPN для привязки:</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await state.set_state(VPNSetup.selecting_profile_for_mapping)
+    
+    # Если сообщение не переслано, предлагаем другие варианты
+    else:
+        await message.answer(
+            "❌ <b>Это не пересланное сообщение</b>\n\n"
+            "Пожалуйста, перешлите сообщение от пользователя, которого хотите привязать.\n\n"
+            "<i>Или нажмите «Назад» и выберите «Добавить вручную» для ввода ID</i>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Повторить", callback_data="clientmap_select_user")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="clients_menu")]
+                ]
+            )
+        )
+
+@dp.callback_query(lambda c: c.data.startswith("map_profile_"))
+async def handle_profile_selection(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_ID:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    profile_name = callback.data.replace("map_profile_", "", 1)
+    state_data = await state.get_data()
+    user_id = state_data.get("target_user_id")
+    user_name = state_data.get("target_user_name")
+
+    if not user_id:
+        await callback.answer("❌ Ошибка: данные пользователя не найдены", show_alert=True)
+        await state.clear()
+        return
+
+    # Проверяем существующие привязки
+    client_map = get_client_mapping()
+    existing = client_map.get(str(user_id), [])
+    if not isinstance(existing, list):
+        existing = [existing] if existing else []
+    
+    is_new = set_client_mapping(user_id, profile_name)
+    
+    if is_new:
+        status_text = "✅ <b>Новый профиль добавлен!</b>"
+        if existing:
+            status_text += f"\n\n📋 У пользователя уже было профилей: {len(existing)}"
+    else:
+        status_text = "⚠️ <b>Такой профиль уже привязан!</b>"
+
+    await callback.message.answer(
+        f"{status_text}\n\n"
+        f"👤 Пользователь: {user_name}\n"
+        f"🔢 Telegram ID: <code>{user_id}</code>\n"
+        f"🔐 Профиль OpenVPN: <b>{profile_name}</b>",
+        reply_markup=create_clients_menu()
+    )
+    await state.clear()
+    await callback.answer()
 
 
 @dp.callback_query(

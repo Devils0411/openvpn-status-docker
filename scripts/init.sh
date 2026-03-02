@@ -30,7 +30,6 @@ NEW_DATABASE_DIR="$DB_DIR/vnstat"
 PORT=${PORT:-$DEFAULT_PORT}
 HTTPS_ON=${HTTPS_ON:-"N"}
 DOMAIN_NAME=${DOMAIN_NAME:-""}
-# SELF_CERT удален - теперь определяется автоматически
 BOT_ON=${BOT_ON:-"N"}
 BOT_TOKEN=${BOT_TOKEN:-""}
 ADMIN_ID=${ADMIN_ID:-""}
