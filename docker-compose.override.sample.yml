@@ -9,8 +9,8 @@ services:
       - PORT=2000
       - ADMIN_USERNAME=admin!
       - ADMIN_PASSWORD=admin!
-#      - BOT_ON=Y
-#      - BOT_TOKEN=1
-#      - ADMIN_ID=1
-#      - HTTPS_ON=Y #Включение HTTPS
+      - BOT_ON=N
+      - BOT_TOKEN=1
+      - ADMIN_ID=1
+      - HTTPS_ON=N #Включение HTTPS
 #      - DOMAIN_NAME=Test.ru #Указываем имя домена, если оно существует. (при условии включения HTTPS)
