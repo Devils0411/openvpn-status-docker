@@ -49,18 +49,19 @@ services:
       - ADMIN_USERNAME=admin!
       - ADMIN_PASSWORD=admin!
 ```
-## Варианты запуска
-Есть несколько вариантов запуска контейнеров:
-
-- [Запуск и подключение к сети antizapret](./docker-compose.override.az.yml)
-- [Запуск и подключение к сети host](./docker-compose.override.host.yml)
-- [Классический запуск](./docker-compose.override.sample.yml)
 
 3) Запуск контейнера:
 ```shell
    docker compose up -d
    docker system prune -f
 ```
+
+## Варианты запуска
+Есть несколько вариантов запуска контейнеров:
+
+- [Запуск и подключение к сети antizapret](./docker-compose.override.az.yml)
+- [Запуск и подключение к сети host](./docker-compose.override.host.yml)
+- [Классический запуск](./docker-compose.override.sample.yml)
 
 # Обновление
 ```shell
@@ -76,7 +77,23 @@ docker exec -e ADMIN_PASSWORD='admin!' openvpn-status ./scripts/chg_pwd.sh
 ```
 
 # HTTPS
-
+## ⚠ **Внимание!**. HTTPS работает в своей сети, или сети HOST.
+Включение HTTPS доступно через переменную `HTTPS_ON=Y`. Пример включения HTTPS в сети `host` через `docker-compose.override.yml`
+Если домен не указан - будет создан самоподписанный сертификат.
+```yml
+services:
+  openvpn-status:
+    network_mode: host
+    extends:
+      file: docker-compose.yml
+      service: openvpn-status
+    environment:
+      - PORT=2000
+      - ADMIN_USERNAME=admin!
+      - ADMIN_PASSWORD=admin!
+      - HTTPS_ON=Y #Включение HTTPS
+#      - DOMAIN_NAME=Test.ru
+```
 
 # Создание и настройка бота
 
