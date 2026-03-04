@@ -77,7 +77,7 @@ docker exec -e ADMIN_PASSWORD='admin!' openvpn-status ./scripts/chg_pwd.sh
 ```
 
 # HTTPS
-## ⚠ **Внимание!**. HTTPS работает в своей сети, или сети HOST.
+## ⚠ **Внимание!** HTTPS работает в своей сети, или сети HOST.
 Включение HTTPS доступно через переменную `HTTPS_ON=Y`. Пример включения HTTPS в сети `host` через `docker-compose.override.yml`
 Если домен не указан - будет создан самоподписанный сертификат.
 ```yml
