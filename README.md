@@ -121,7 +121,7 @@ services:
    1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ12345678  
    ```
 
-### Получение личного ID**  
+### Получение личного ID
 
 1. Открываем Telegram и ищем [**`@userinfobot`**](https://t.me/userinfobot).  
 2. Переходим в чат и нажимаем **"Start"**.  
