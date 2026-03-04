@@ -353,29 +353,28 @@ chmod=0700
 [supervisorctl]
 serverurl=unix:///var/run/supervisor.sock
 
+
+# ==========================================
+# Добавление main.py в Supervisor
+# ==========================================
 [program:gunicorn]
 command=gunicorn -w 4 main:app -b $GUNICORN_BIND
 directory=$ROOT_DIR
 autostart=true
 autorestart=true
-stdout_logfile=$LOGS_DIR/gunicorn.stdout.log
 stderr_logfile=$LOGS_DIR/gunicorn.stderr.log
-stdout_logfile_maxbytes=10MB
 stderr_logfile_maxbytes=10MB
-stdout_logfile_backups=5
 stderr_logfile_backups=5
 
+
+# ==========================================
+# Добавление Logs.py в Supervisor
+# ==========================================
 [program:logs]
 command=/bin/sh -c "sleep 30 && while true; do /usr/local/bin/python $ROOT_DIR/src/logs.py; sleep 30; done"
 directory=$ROOT_DIR/src
 autostart=true
 autorestart=true
-stdout_logfile=$LOGS_DIR/logs.stdout.log
-stderr_logfile=$LOGS_DIR/logs.stderr.log
-stdout_logfile_maxbytes=10MB
-stderr_logfile_maxbytes=10MB
-stdout_logfile_backups=5
-stderr_logfile_backups=5
 EOF
     
     echo -e "${GREEN}Базовая настройка Supervisord завершена.${RESET}"
@@ -420,12 +419,6 @@ autorestart=true
 startretries=3
 startsecs=300
 restartpause=10
-stdout_logfile=$LOGS_DIR/vpn_bot.stdout.log
-stderr_logfile=$LOGS_DIR/vpn_bot.stderr.log
-stdout_logfile_maxbytes=10MB
-stderr_logfile_maxbytes=10MB
-stdout_logfile_backups=5
-stderr_logfile_backups=5
 EOF
     
     if [ ! -f "$ENV_FILE" ]; then

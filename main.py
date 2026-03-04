@@ -12,7 +12,7 @@ import socket
 import subprocess
 import json
 import logging
-
+from logging.handlers import RotatingFileHandler
 from statistics import mean
 from threading import Lock
 from tzlocal import get_localzone
@@ -34,7 +34,6 @@ from flask import (
     jsonify,
     session,
 )
-
 from src.forms import LoginForm
 from src.config import Config
 from flask_bcrypt import Bcrypt
@@ -42,9 +41,89 @@ from datetime import date, datetime, timezone, timedelta
 from zoneinfo._common import ZoneInfoNotFoundError
 from collections import defaultdict
 
+# ============================================================================
+# НАСТРОЙКА ЛОГИРОВАНИЯ С РАЗДЕЛЕНИЕМ ПО УРОВНЯМ И РОТАЦИЕЙ ФАЙЛОВ
+# ============================================================================
+# Берем путь к папке Logs из конфиг файла
+LOG_DIR = Config.LOGS_PATH
+
+# Полные пути к файлам логов
+STDOUT_LOG = os.path.join(LOG_DIR, 'main.stdout.log')
+STDERR_LOG = os.path.join(LOG_DIR, 'main.stderr.log')
+
+# Параметры ротации
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 МБ
+BACKUP_COUNT = 5                 # Хранить 5 последних файлов
+
+# Очищаем ВСЕ обработчики корневого логгера (важно!)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+
+class LevelFilter(logging.Filter):
+    """Фильтр для разделения логов по уровням."""
+    def __init__(self, min_level, max_level=None):
+        super().__init__()
+        self.min_level = min_level
+        self.max_level = max_level or min_level
+
+    def filter(self, record):
+        return self.min_level <= record.levelno <= self.max_level
+
+
+# Создаём logger
+logger = logging.getLogger(__name__)
+#logger.setLevel(logging.DEBUG)  # Принимаем все уровни
+logger.setLevel(logging.WARNING)  # Принимаем WARNING+
+logger.propagate = False  # ❗ Важно: не передавать логи в root-логгер
+
+# Очищаем существующие обработчики
+logger.handlers.clear()
+
+# ============================================================================
+# ФАЙЛ ДЛЯ WARNING, ERROR, CRITICAL (stderr)
+# ============================================================================
+stderr_handler = RotatingFileHandler(
+    STDERR_LOG,
+    maxBytes=MAX_LOG_SIZE,
+    backupCount=BACKUP_COUNT,
+    encoding='utf-8',
+    delay=True
+)
+stderr_handler.setLevel(logging.WARNING)  # Только WARNING и выше
+stderr_handler.addFilter(LevelFilter(logging.WARNING, logging.CRITICAL))
+stderr_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%d-%m-%Y %H:%M:%S'
+)
+stderr_handler.setFormatter(stderr_formatter)
+
+# ============================================================================
+# ФАЙЛ ДЛЯ INFO, DEBUG (stdout)
+# ============================================================================
+stdout_handler = RotatingFileHandler(
+    STDOUT_LOG,
+    maxBytes=MAX_LOG_SIZE,
+    backupCount=BACKUP_COUNT,
+    encoding='utf-8',
+    delay=True
+)
+stdout_handler.setLevel(logging.DEBUG)  # DEBUG и INFO
+stdout_handler.addFilter(LevelFilter(logging.DEBUG, logging.INFO))
+stdout_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%d-%m-%Y %H:%M:%S'
+)
+stdout_handler.setFormatter(stdout_formatter)
+
+# ============================================================================
+# ДОБАВЛЯЕМ ОБРАБОТЧИКИ К LOGGER
+# ============================================================================
+logger.addHandler(stderr_handler)
+# logger.addHandler(stdout_handler) Раскомментировать при необходимости
+
 
 class ScriptNameMiddleware:
-
     def __init__(self, app):
         self.app = app
 
@@ -76,10 +155,10 @@ app.wsgi_app = ScriptNameMiddleware(app.wsgi_app)
 
 DOCKER_HUB_REPO = "devils0411/openvpn-status"  # Укажите ваш namespace/repo
 DOCKER_HUB_API = f"https://hub.docker.com/v2/repositories/{DOCKER_HUB_REPO}/tags/"
-
 bcrypt = Bcrypt(app)
 loginManager = LoginManager(app)
 loginManager.login_view = "login"
+
 # Получаем LOG_FILES из конфигурации
 LOG_FILES = Config.LOG_FILES
 
@@ -87,19 +166,19 @@ LOG_FILES = Config.LOG_FILES
 cached_system_info = None
 last_fetch_time = 0
 CACHE_DURATION = 10  # обновление кэша каждые 10 секунд
+
 cpu_history = []
 ram_history = []
 MAX_CPU_HISTORY = 60 * 12  # хранить 12 часов с шагом 1 минута
 DB_SAVE_INTERVAL = 300  # запись в БД каждые 5 минут
 last_db_save = 0
-
 SAMPLE_INTERVAL = 10  # текущая частота сбора
 MAX_HISTORY_SECONDS = 7 * 24 * 3600  # сколько секунд хранить в памяти
 LIVE_POINTS = 60
 last_collect = 0
+
 BOT_RESTART_LOCK = Lock()
 BOT_SERVICE_NAME = "telegram-bot"
-
 ENV_PATH = Config.ENV_PATH
 SETTINGS_PATH = Config.SETTINGS_PATH
 LEGACY_ADMIN_INFO_PATH = Config.LEGACY_ADMIN_INFO_PATH
@@ -116,8 +195,11 @@ def read_env_values():
                     continue
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
+        logger.debug(f"✅ Прочитано {len(values)} переменных из .env")
     except FileNotFoundError:
-        return values
+        logger.warning(f"Файл .env не найден: {ENV_PATH}")
+    except Exception as e:
+        logger.error(f"Ошибка чтения .env файла: {e}")
     return values
 
 
@@ -132,14 +214,20 @@ def can_start_bot(env_values=None):
 def update_env_values(updates):
     updates = {key: value for key, value in updates.items() if key}
     if not updates:
+        logger.debug("Нет обновлений для .env файла")
         return
-
+    
     updated_keys = set()
     lines = []
+    
     try:
         with open(ENV_PATH, "r", encoding="utf-8") as env_file:
             lines = env_file.readlines()
     except FileNotFoundError:
+        logger.warning(f"Файл .env не найден, создаю новый: {ENV_PATH}")
+        lines = []
+    except Exception as e:
+        logger.error(f"Ошибка чтения .env файла: {e}")
         lines = []
 
     new_lines = []
@@ -160,8 +248,12 @@ def update_env_values(updates):
         if key not in updated_keys:
             new_lines.append(f"{key}={value}\n")
 
-    with open(ENV_PATH, "w", encoding="utf-8") as env_file:
-        env_file.writelines(new_lines)
+    try:
+        with open(ENV_PATH, "w", encoding="utf-8") as env_file:
+            env_file.writelines(new_lines)
+        logger.info(f"✅ Обновлены ключи в .env: {list(updates.keys())}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка записи в .env файл: {e}")
 
 
 DEFAULT_SETTINGS = {
@@ -172,19 +264,28 @@ DEFAULT_SETTINGS = {
 
 
 def write_settings_data(settings_data):
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as settings_file:
-        json.dump(settings_data, settings_file, ensure_ascii=False, indent=4)
-        settings_file.write("\n")
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as settings_file:
+            json.dump(settings_data, settings_file, ensure_ascii=False, indent=4)
+            settings_file.write("\n")
+        logger.debug(f"✅ Настройки сохранены: {SETTINGS_PATH}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения настроек: {e}")
 
 
 def read_settings():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
             data = json.load(settings_file)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Файл настроек не найден или ошибка парсинга: {e}")
         data = {}
-
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка загрузки настроек: {e}")
+        data = {}
+    
     if not isinstance(data, dict):
+        logger.warning("Данные настроек не являются словарём, инициализирую пустой dict")
         data = {}
 
     merged = DEFAULT_SETTINGS.copy()
@@ -222,7 +323,7 @@ def read_admin_info():
 
 
 def parse_admin_ids(admin_id_value):
-    placeholder = "<Enter your user ID>"
+    placeholder = ""
     admin_ids = []
     for item in admin_id_value.split(","):
         item = item.strip()
@@ -242,7 +343,6 @@ def format_admin_display(admin_id, admin_info):
     info = admin_info.get(admin_id, {})
     display_name = (info.get("display_name") or "").strip()
     username = (info.get("username") or "").strip()
-
     if display_name and username:
         return f"{display_name} (@{username})"
     if display_name:
@@ -322,19 +422,25 @@ def restart_telegram_bot_async():
                 text=True,
             )
             if result.returncode == 0:
+                logger.info("✅ Бот telegram-bot успешно перезапущен")
                 return True, None
             else:
                 error_msg = result.stderr.strip() or result.stdout.strip() or "неизвестная ошибка"
+                logger.error(f"❌ Ошибка перезапуска бота: {error_msg}")
                 return False, error_msg
         except Exception as exc:
+            logger.error(f"❌ Исключение при перезапуске бота: {exc}")
             return False, str(exc) or "неизвестная ошибка"
+
 
 def restart_telegram_bot():
     """Запускает перезапуск в отдельном потоке"""
     thread = threading.Thread(target=restart_telegram_bot_async)
     thread.daemon = True
     thread.start()
+    logger.info("🔄 Запущен асинхронный перезапуск бота")
     return True, None  # Возвращаем сразу успех
+
 
 def stop_telegram_bot():
     """
@@ -351,11 +457,14 @@ def stop_telegram_bot():
                 text=True,
             )
             if result.returncode == 0:
+                logger.info("✅ Бот telegram-bot успешно остановлен")
                 return True, None
             else:
                 error_msg = result.stderr.strip() or result.stdout.strip() or "неизвестная ошибка"
+                logger.error(f"❌ Ошибка остановки бота: {error_msg}")
                 return False, error_msg
         except Exception as exc:
+            logger.error(f"❌ Исключение при остановке бота: {exc}")
             return False, str(exc) or "неизвестная ошибка"
 
 
@@ -374,11 +483,16 @@ def get_telegram_bot_status():
         )
         status = result.stdout.strip().upper()
         if "RUNNING" in status or "STARTING" in status:
+            logger.debug("🟢 Бот telegram-bot активен")
             return True
-    except Exception:
+        logger.debug("🔴 Бот telegram-bot не активен")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки статуса бота: {e}")
         return False
 
-# Функция для подлючения к базе данных SQLite
+
+# Функция для подключения к базе данных SQLite
 def get_db_connection():
     conn = sqlite3.connect(app.config["DATABASE_PATH"])
     conn.row_factory = sqlite3.Row  # Для получения результатов в виде словаря
@@ -390,15 +504,16 @@ def create_users_table():
     conn = get_db_connection()
     conn.execute(
         """CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            role  TEXT NOT NULL,
-            password TEXT NOT NULL
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        role  TEXT NOT NULL,
+        password TEXT NOT NULL
         )
-    """
+        """
     )
     conn.commit()
     conn.close()
+    logger.debug("✅ Таблица пользователей создана/проверена")
 
 
 # Вызываем функцию для создания таблицы при запуске приложения
@@ -437,9 +552,9 @@ def add_user(username, role, password):
     existing_user = conn.execute(
         "SELECT * FROM users WHERE username = ?", (username,)
     ).fetchone()
-    
     if existing_user:
         print(f"Пользователь уже существует.")
+        logger.info(f"Пользователь {username} уже существует.")
         conn.close()
         return
     hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
@@ -449,14 +564,14 @@ def add_user(username, role, password):
     )
     conn.commit()
     conn.close()
-    print(password)
+    logger.info(f"✅ Пользователь {username} успешно добавлен")
     return
 
 
 # Функция для генерации случайного пароля
-def get_random_pass(lenght=10):
+def get_random_pass(length=10):
     characters = string.ascii_letters + string.digits  # Буквы и цифры
-    random_pass = "".join(random.choice(characters) for _ in range(lenght))
+    random_pass = "".join(random.choice(characters) for _ in range(length))
     return random_pass
 
 
@@ -464,26 +579,23 @@ def get_random_pass(lenght=10):
 def add_admin():
     conn = get_db_connection()
     passw = get_random_pass()
-    count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[
-        0
-    ]
-
+    count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
     if count < 1:
         add_user("admin", "admin", passw)
-        # print(f"Пароль администратора: {passw}")
-
+        logger.info(f"🔑 Создан администратор. Пароль: {passw}")
+    else:
+        logger.debug("ℹ️ Администратор уже существует")
     conn.close()
     return passw
 
 
 # Функция для изменения пароля администратора
 def change_admin_password():
-
     conn = get_db_connection()
     admin_user = conn.execute("SELECT * FROM users WHERE role = 'admin'").fetchone()
 
     if not admin_user:
-        print("Администратор не найден.")
+        logger.warning("⚠️ Администратор не найден.")
         conn.close()
         return
 
@@ -498,6 +610,8 @@ def change_admin_password():
     conn.close()
 
     print(f"{passw}")
+    logger.info(f"🔑 Пароль администратора изменён: {passw}")
+
 
 def change_admin_password_2(new_password):
     """
@@ -505,15 +619,14 @@ def change_admin_password_2(new_password):
     :param new_password: Новый пароль администратора (строка).
     """
     if not new_password:
-        print("Новый пароль не может быть пустым.")
+        logger.warning("⚠️ Новый пароль не может быть пустым.")
         return
-
     # Подключаемся к базе данных
     conn = get_db_connection()
     admin_user = conn.execute("SELECT * FROM users WHERE role = 'admin'").fetchone()
 
     if not admin_user:
-        print("Администратор не найден.")
+        logger.warning("⚠️ Администратор не найден.")
         conn.close()
         return
 
@@ -527,8 +640,8 @@ def change_admin_password_2(new_password):
     )
     conn.commit()
     conn.close()
-
     print(f"Пароль администратора успешно изменён: {new_password}")
+    logger.info(f"✅ Пароль администратора успешно изменён")
 
 
 # ---------WireGuard----------
@@ -538,20 +651,18 @@ def get_wireguard_stats():
         result = subprocess.run(
             ["/usr/bin/wg", "show"], capture_output=True, text=True, check=True
         )
+        logger.debug("✅ Команда wg show выполнена успешно")
         return result.stdout
     except subprocess.CalledProcessError as e:
-        print(f"Команда wg show завершилась с ошибкой: {e.stderr}")
+        logger.error(f"❌ Команда wg show завершилась с ошибкой: {e.stderr}")
         return f"Ошибка выполнения команды: {e.stderr}"
     except FileNotFoundError:
-        print(
-            "Команда wg не найдена. Убедитесь, что WireGuard установлен и доступен в системе."
-        )
+        logger.error("❌ Команда wg не найдена. Убедитесь, что WireGuard установлен и доступен в системе.")
         return "Команда wg не найдена."
 
 
 def format_handshake_time(handshake_string):
     time_units = re.findall(r"(\d+)\s+(\w+)", handshake_string)
-
     # Словарь для перевода единиц времени в сокращения
     abbreviations = {
         "year": "г.",
@@ -588,7 +699,6 @@ def parse_relative_time(relative_time):
     """Преобразует строку с днями, часами, минутами и секундами в абсолютное время."""
     now = datetime.now()
     time_deltas = {"days": 0, "hours": 0, "minutes": 0, "seconds": 0}
-
     # Разбиваем строку на части
     parts = relative_time.split()
     i = 0
@@ -622,7 +732,6 @@ def parse_relative_time(relative_time):
 def read_wg_config(file_path):
     """Считывает клиентские данные из конфигурационного файла WireGuard."""
     client_mapping = {}
-
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             current_client_name = None
@@ -645,9 +754,10 @@ def read_wg_config(file_path):
                     client_mapping[public_key] = current_client_name
 
     except FileNotFoundError:
-        print(f"Конфигурационный файл {file_path} не найден.")
+        logger.warning(f"⚠️ Конфигурационный файл {file_path} не найден.")
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения конфига WireGuard {file_path}: {e}")
 
-    # print(client_mapping)
     return client_mapping
 
 
@@ -677,7 +787,6 @@ def parse_wireguard_output(output):
     stats = []
     lines = output.strip().splitlines()
     interface_data = {}
-
     vpn_mapping = read_wg_config("/etc/wireguard/vpn.conf")
     antizapret_mapping = read_wg_config("/etc/wireguard/antizapret.conf")
     client_mapping = {**vpn_mapping, **antizapret_mapping}
@@ -689,16 +798,16 @@ def parse_wireguard_output(output):
             if interface_data:
                 stats.append(interface_data)
                 interface_data = {}
-            interface_data["interface"] = line.split(": ")[1]
+            interface_data["interface"] = line.split(":  ")[1]
         elif line.startswith("public key:"):
-            public_key = line.split(": ")[1]
+            public_key = line.split(":  ")[1]
             interface_data["public_key"] = public_key
         elif line.startswith("listening port:"):
-            interface_data["listening_port"] = line.split(": ")[1]
+            interface_data["listening_port"] = line.split(":  ")[1]
         elif line.startswith("peer:"):
             if "peers" not in interface_data:
                 interface_data["peers"] = []
-            peer_data = {"peer": line.split(": ")[1].strip()}
+            peer_data = {"peer": line.split(":  ")[1].strip()}
             masked_peer = peer_data["peer"][:4] + "..." + peer_data["peer"][-4:]
             peer_data["masked_peer"] = masked_peer
             peer_data["client"] = client_mapping.get(peer_data["peer"], "N/A")
@@ -724,14 +833,14 @@ def parse_wireguard_output(output):
                 peer_data["daily_traffic_percentage"] = 0
             interface_data["peers"].append(peer_data)
         elif line.startswith("endpoint:"):
-            peer_data["endpoint"] = mask_ip(line.split(": ")[1].strip())
+            peer_data["endpoint"] = mask_ip(line.split(":  ")[1].strip())
         elif line.startswith("allowed ips:"):
-            allowed_ips = line.split(": ")[1].split(", ")
+            allowed_ips = line.split(":  ")[1].split(",  ")
             peer_data["allowed_ips"] = allowed_ips
             peer_data["visible_ips"] = allowed_ips[:1]
             peer_data["hidden_ips"] = allowed_ips[1:]
         elif line.startswith("latest handshake:"):
-            handshake_time = line.split(": ")[1].strip()
+            handshake_time = line.split(":  ")[1].strip()
 
             if handshake_time.lower() == "now":
                 formatted_handshake_time = datetime.now()
@@ -752,27 +861,14 @@ def parse_wireguard_output(output):
                 )
                 peer_data["latest_handshake"] = format_handshake_time(handshake_time)
                 peer_data["online"] = is_peer_online(formatted_handshake_time)
-        
-        elif line.startswith("latest handshake:"):
-            handshake_time = line.split(": ")[1].strip()
-            if any(
-                unit in handshake_time
-                for unit in ["мин", "час", "сек", "minute", "hour", "second"]
-            ):
-                formatted_handshake_time = parse_relative_time(handshake_time)
-            else:
-                formatted_handshake_time = datetime.strptime(
-                    handshake_time, "%Y-%m-%d %H:%M:%S"
-                )
-            peer_data["latest_handshake"] = format_handshake_time(handshake_time)
-            peer_data["online"] = is_peer_online(formatted_handshake_time)
+    
         elif line.startswith("transfer:"):
-            transfer_data = line.split(":")[1].strip().split(", ")
-            received = transfer_data[0].replace(" received", "").strip()
-            sent = transfer_data[1].replace(" sent", "").strip()
+            transfer_data = line.split(": ")[1].strip().split(",  ")
+            received = transfer_data[0].replace(" received", " ").strip()
+            sent = transfer_data[1].replace(" sent", " ").strip()
 
-            received_str = transfer_data[0].replace(" received", "").strip()
-            sent_str = transfer_data[1].replace(" sent", "").strip()
+            received_str = transfer_data[0].replace(" received", " ").strip()
+            sent_str = transfer_data[1].replace(" sent", " ").strip()
 
             # Конвертируем строки в байты
             peer_data["received_bytes"] = (
@@ -798,6 +894,7 @@ def parse_wireguard_output(output):
     if interface_data:
         stats.append(interface_data)
 
+    logger.debug(f"✅ Распаршено {len(stats)} интерфейсов WireGuard")
     return stats
 
 
@@ -807,7 +904,6 @@ def get_daily_stats():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     date_today = date.today().isoformat()
-
     cursor.execute(
         "SELECT interface, client, received, sent FROM wg_daily_stats WHERE date = ?",
         (date_today,),
@@ -838,23 +934,22 @@ def format_bytes(size):
 
 def parse_bytes(value):
     """Преобразует строку с размером данных в байты."""
-    size, unit = value.split(" ")
+    size, unit = value.split("  ")
     size = float(size)
     unit = unit.lower()
     if unit == "kb":
         return size * 1024
     elif unit == "mb":
-        return size * 1024**2
+        return size * 1024 ** 2
     elif unit == "gb":
-        return size * 1024**3
+        return size * 1024 ** 3
     elif unit == "tb":
-        return size * 1024**4
+        return size * 1024 ** 4
     return size
 
 
 # Функция для склонения слова "клиент"
 def pluralize_clients(count):
-
     if 11 <= count % 100 <= 19:
         return f"{count} клиентов"
     elif count % 10 == 1:
@@ -871,12 +966,16 @@ def get_external_ip():
         response = requests.get("https://api.ipify.org", timeout=10)
         if response.status_code == 200:
             return response.text
+        logger.warning(f"⚠️ Не удалось получить внешний IP. Статус: {response.status_code}")
         return "IP не найден"
     except requests.Timeout:
+        logger.error("❌ Ошибка: запрос превысил время ожидания при получении IP.")
         return "Ошибка: запрос превысил время ожидания."
     except requests.ConnectionError:
+        logger.error("❌ Ошибка: нет подключения к интернету при получении IP.")
         return "Ошибка: нет подключения к интернету."
     except requests.RequestException as e:
+        logger.error(f"❌ Ошибка при запросе внешнего IP: {e}")
         return f"Ошибка при запросе: {e}"
 
 
@@ -893,7 +992,6 @@ def format_date(date_string):
 def mask_ip(ip_address):
     if not ip_address:
         return "0.0.0.0"  # Значение по умолчанию
-
     ip = ip_address.split(":")[0]
     parts = ip.split(".")
 
@@ -907,11 +1005,10 @@ def mask_ip(ip_address):
     return ip_address
 
 
-# Отсет времени
+# Отсчет времени
 def format_duration(start_time):
     now = datetime.now()  # Текущее время
     delta = now - start_time  # Разница во времени
-
     days = delta.days
     seconds = delta.seconds
     hours, remainder = divmod(seconds, 3600)
@@ -939,8 +1036,8 @@ def read_csv(file_path, protocol):
     data = []
     total_received, total_sent = 0, 0
     current_time = datetime.now()
-
     if not os.path.exists(file_path):
+        logger.warning(f"⚠️ Файл логов не найден: {file_path}")
         return [], 0, 0, None
 
     with open(file_path, newline="", encoding="utf-8") as csvfile:
@@ -1006,13 +1103,13 @@ def read_csv(file_path, protocol):
                     ]
                 )
 
+    logger.debug(f"✅ Прочитано {len(data)} клиентов из {file_path}")
     return data, total_received, total_sent, None
 
 
 # ---------Метрики----------
 def ensure_db():
     """Создает таблицу system_stats, если она не существует."""
-
     conn = sqlite3.connect(app.config["SYSTEM_STATS_PATH"])
     cur = conn.cursor()
     cur.execute(
@@ -1028,6 +1125,7 @@ def ensure_db():
 
     conn.commit()
     conn.close()
+    logger.debug("✅ Таблица system_stats создана/проверена")
 
 
 def save_minute_average_to_db():
@@ -1039,7 +1137,6 @@ def save_minute_average_to_db():
         return
     cpu_avg = mean([p["cpu"] for p in to_avg])
     ram_avg = mean([p["ram"] for p in to_avg])
-
     try:
         conn = sqlite3.connect(app.config["SYSTEM_STATS_PATH"])
         cur = conn.cursor()
@@ -1058,13 +1155,13 @@ def save_minute_average_to_db():
 
         conn.commit()
         conn.close()
+        logger.debug(f"✅ Сохранены метрики в БД: CPU={cpu_avg:.2f}%, RAM={ram_avg:.2f}%")
     except Exception as e:
-        print("[DB ERROR] save_minute_average_to_db:", e)
+        logger.error(f"[DB ERROR] save_minute_average_to_db: {e}")
 
 
 def group_rows(rows, interval="minute"):
     """Группирует ряды по интервалу и усредняет значения CPU и RAM."""
-
     grouped = {}
 
     for r in rows:
@@ -1121,7 +1218,6 @@ def resample_to_n(data, n):
 def update_system_info_loop():
     global last_db_save, last_collect
     ensure_db()
-
     while True:
         now = time.time()
         if now - last_collect >= SAMPLE_INTERVAL:
@@ -1154,8 +1250,8 @@ def get_default_interface():
             if "default" in line:
                 return line.split()[4]
     except Exception as e:
-        print(f"Ошибка: {e}")
-    return None
+        logger.error(f"❌ Ошибка получения интерфейса: {e}")
+        return None
 
 
 def get_network_stats(interface):
@@ -1170,6 +1266,7 @@ def get_network_stats(interface):
             tx_bytes = int(f.read().strip())
         return {"interface": interface, "rx": rx_bytes, "tx": tx_bytes}
     except FileNotFoundError:
+        logger.warning(f"⚠️ Интерфейс {interface} не найден")
         return None  # Если интерфейс не найден
 
 
@@ -1177,7 +1274,6 @@ def get_network_load():
     net_io_start = psutil.net_io_counters(pernic=True)
     time.sleep(1)
     net_io_end = psutil.net_io_counters(pernic=True)
-
     network_data = {}
     for interface in net_io_start:
         if interface.startswith(("lo", "docker", "veth", "br-")):
@@ -1211,13 +1307,13 @@ def get_uptime():
         )
     except subprocess.CalledProcessError:
         uptime = "Не удалось получить время работы"
+        logger.warning("⚠️ Не удалось получить uptime системы")
     return uptime
 
 
 def format_uptime(uptime_string):
     # Регулярное выражение с учетом лет, месяцев, недель, дней, часов и минут
-    pattern = r"(?:(\d+)\s*years?|(\d+)\s*months?|(\d+)\s*weeks?|(\d+)\s*days?|(\d+)\s*hours?|(\d+)\s*minutes?)"
-
+    pattern = r"(?:(\d+)\syears?|(\d+)\smonths?|(\d+)\sweeks?|(\d+)\sdays?|(\d+)\shours?|(\d+)\sminutes?)"
     years = 0
     months = 0
     weeks = 0
@@ -1262,12 +1358,10 @@ def format_uptime(uptime_string):
 def count_online_clients(file_paths):
     total_openvpn = 0
     results = {}
-
     # Подсчёт WireGuard
 #    try:
 #        wg_output = subprocess.check_output(["/usr/bin/wg", "show"], text=True)
 #        wg_latest_handshakes = re.findall(r"latest handshake: (.+)", wg_output)
-
 #        online_wg = 0
 #        for handshake in wg_latest_handshakes:
 #            handshake_str = handshake.strip()
@@ -1282,9 +1376,10 @@ def count_online_clients(file_paths):
 #                except Exception:
 #                    continue
 #        results["WireGuard"] = online_wg
-#    except Exception:
-#        results["WireGuard"] = 0  # или f"Ошибка: {e}" по желанию
-
+#    except Exception as e:
+#        logger.error(f"❌ Ошибка подсчёта клиентов WireGuard: {e}")
+#        results["WireGuard"] = 0
+    
     # Подсчёт OpenVPN
     for path, _ in file_paths:
         try:
@@ -1292,10 +1387,13 @@ def count_online_clients(file_paths):
                 for line in f:
                     if line.startswith("CLIENT_LIST"):
                         total_openvpn += 1
-        except:
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка чтения файла логов {path}: {e}")
             continue
 
     results["OpenVPN"] = total_openvpn
+    logger.debug(f"📊 Онлайн клиенты: OVPN={results['OpenVPN']}")
+#    logger.debug(f"📊 Онлайн клиенты: WG={results['WireGuard']}, OVPN={results['OpenVPN']}")
     return results
 
 
@@ -1306,7 +1404,6 @@ def get_system_info():
 
 def update_system_info():
     global cached_system_info, last_fetch_time, cpu_history, last_db_save
-
     while True:
         current_time = time.time()
         if not cached_system_info or (current_time - last_fetch_time >= CACHE_DURATION):
@@ -1331,10 +1428,10 @@ def update_system_info():
 
             cached_system_info = {
                 "cpu_load": cpu_percent,
-                "memory_used": psutil.virtual_memory().used // (1024**2),
-                "memory_total": psutil.virtual_memory().total // (1024**2),
-                "disk_used": psutil.disk_usage("/").used // (1024**3),
-                "disk_total": psutil.disk_usage("/").total // (1024**3),
+                "memory_used": psutil.virtual_memory().used // (1024 ** 2),
+                "memory_total": psutil.virtual_memory().total // (1024 ** 2),
+                "disk_used": psutil.disk_usage("/").used // (1024 ** 3),
+                "disk_total": psutil.disk_usage("/").total // (1024 ** 3),
                 "network_load": get_network_load(),
                 "uptime": format_uptime(get_uptime()),
                 "network_interface": interface or "Не найдено",
@@ -1344,6 +1441,7 @@ def update_system_info():
             }
 
             last_fetch_time = current_time
+            logger.debug(f"📊 Системная информация обновлена: CPU={cpu_percent}%, RAM={ram_percent}%")
 
         time.sleep(CACHE_DURATION)
 
@@ -1351,6 +1449,8 @@ def update_system_info():
 # Запуск фоновой задачи
 threading.Thread(target=update_system_info, daemon=True).start()
 threading.Thread(target=update_system_info_loop, daemon=True).start()
+logger.info("✅ Фоновые задачи мониторинга запущены")
+
 
 def get_vnstat_interfaces():
     try:
@@ -1358,7 +1458,6 @@ def get_vnstat_interfaces():
             ["/usr/bin/vnstat", "--json"], capture_output=True, text=True, check=True
         )
         data = json.loads(result.stdout)
-
         interfaces = []
         for iface in data.get("interfaces", []):
             name = iface.get("name")
@@ -1373,8 +1472,9 @@ def get_vnstat_interfaces():
         return interfaces
 
     except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-        print(f"Ошибка при получении интерфейсов: {e}")
+        logger.error(f"❌ Ошибка при получении интерфейсов vnstat: {e}")
         return []
+
 
 # Маршрут для выхода из системы
 @app.route("/logout", methods=["GET", "POST"])
@@ -1382,6 +1482,7 @@ def get_vnstat_interfaces():
 def logout():
     logout_user()
     session.pop("last_activity", None)
+    logger.info(f"👤 Пользователь {current_user.username} вышел из системы")
     return redirect(url_for("login"))
 
 
@@ -1389,7 +1490,6 @@ def logout():
 def track_last_activity():
     if request.path.startswith("/api/"):
         return
-
     session.permanent = True
     session["last_activity"] = time.time()
 
@@ -1398,7 +1498,6 @@ def track_last_activity():
 def login():
     if current_user.is_authenticated:
         return redirect(url_for("home"))
-
     form = LoginForm()
     error_message = None
 
@@ -1417,6 +1516,7 @@ def login():
                 password=user["password"],
             )
             login_user(user_obj, remember=form.remember_me.data)
+            logger.info(f"✅ Пользователь {form.username.data} успешно вошёл в систему")
 
             # Просто указываем, должна ли сессия быть "долгой"
             session.permanent = form.remember_me.data
@@ -1425,6 +1525,7 @@ def login():
             return redirect(next_page or url_for("home"))
         else:
             error_message = "Неправильный логин или пароль!"
+            logger.warning(f"⚠️ Неудачная попытка входа для пользователя: {form.username.data}")
 
     # Добавляем заголовок запрета индексации
     resp = make_response(
@@ -1434,19 +1535,23 @@ def login():
     return resp
 
 
-#def get_git_version():
-#    try:
-#        version = (
-#            subprocess.check_output(
-#                ["/usr/bin/git", "describe", "--tags", "--abbrev=0"],
-#                stderr=subprocess.DEVNULL,
-#            )
-#            .strip()
-#            .decode()
-#        )
-#    except (subprocess.CalledProcessError, FileNotFoundError):
-#        version = "unknown"
-#    return version
+# def get_git_version():
+def get_git_version():
+    try:
+        version = (
+            subprocess.check_output(
+                ["/usr/bin/git", "describe", "--tags", "--abbrev=0"],
+                stderr=subprocess.DEVNULL,
+            )
+            .strip()
+            .decode()
+        )
+        logger.debug(f"📦 Git версия: {version}")
+        return version
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning(f"⚠️ Не удалось получить Git версию: {e}")
+        return "unknown"
+
 
 def get_docker_hub_version():
     """
@@ -1463,7 +1568,6 @@ def get_docker_hub_version():
         )
         response.raise_for_status()
         data = response.json()
-        
         tags = [t["name"] for t in data.get("results", []) if t.get("name")]
         
         # Фильтруем теги: оставляем только семантические версии (vX.Y.Z или X.Y.Z)
@@ -1473,16 +1577,20 @@ def get_docker_hub_version():
         
         if version_tags:
             # Возвращаем первый (самый новый) тег
-            return version_tags[0]
+            version = version_tags[0]
+            logger.debug(f"📦 Docker Hub версия: {version}")
+            return version
         
         # fallback: если нет semver-тегов, возвращаем первый непустой тег
-        return tags[0] if tags else "unknown"
+        version = tags[0] if tags else "unknown"
+        logger.debug(f"📦 Docker Hub версия (fallback): {version}")
+        return version
         
     except requests.RequestException as e:
-        logging.warning(f"Failed to fetch version from Docker Hub: {e}")
+        logger.warning(f"⚠️ Failed to fetch version from Docker Hub: {e}")
         return "unknown"
     except Exception as e:
-        logging.error(f"Unexpected error fetching Docker Hub version: {e}")
+        logger.error(f"❌ Unexpected error fetching Docker Hub version: {e}")
         return "unknown"
 
 
@@ -1492,7 +1600,7 @@ def inject_info():
     return {
         "hostname": socket.gethostname(),
         "server_ip": get_external_ip(),
-#        "version": get_git_version(),
+        "version": get_git_version(),
         "version": get_docker_hub_version(),
         "base_path": request.script_root or "",
         "app_name": app_name,
@@ -1505,7 +1613,7 @@ def home():
     server_ip = get_external_ip()
     system_info = get_system_info()
     hostname = socket.gethostname()
-
+    logger.debug(f"📄 Запрошена главная страница пользователем {current_user.username}")
     return render_template(
         "index.html",
         server_ip=server_ip,
@@ -1522,7 +1630,6 @@ def settings():
     bot_error = None
     app_message = None
     app_error = None
-
     if request.method == "POST":
         form_type = request.form.get("form_type")
 
@@ -1540,14 +1647,16 @@ def settings():
             should_start = bool(bot_enabled and bot_token)
 
             if should_start:
-                restart_ok, restart_error = restart_telegram_bot()
+                restart_ok, restart_err = restart_telegram_bot()
                 if restart_ok:
                     bot_message = "Настройки бота сохранены. Бот перезапущен."
+                    logger.info("✅ Бот перезапущен через настройки")
                 else:
                     bot_error = (
                         "Настройки бота сохранены, но перезапуск не удался: "
-                        f"{restart_error}"
+                        f"{restart_err}"
                     )
+                    logger.error(f"❌ Ошибка перезапуска бота: {restart_err}")
             else:
                 restart_ok, restart_error = stop_telegram_bot()
                 if restart_ok:
@@ -1557,19 +1666,23 @@ def settings():
                         )
                     else:
                         bot_message = "Настройки бота сохранены. Бот остановлен."
+                    logger.info("✅ Бот остановлен через настройки")
                 else:
                     bot_error = (
                         "Настройки бота сохранены, но остановка не удалась: "
                         f"{restart_error}"
                     )
+                    logger.error(f"❌ Ошибка остановки бота: {restart_error}")
 
         elif form_type == "app_name":
             app_name = request.form.get("app_name", "").strip()
             write_settings({"app_name": app_name})
             if app_name:
                 app_message = "Название приложения обновлено."
+                logger.info(f"✅ Название приложения обновлено: {app_name}")
             else:
                 app_message = "Название приложения убрано."
+                logger.info("ℹ️ Название приложения сброшено")
 
     env_values = read_env_values()
     bot_token_value = env_values.get("BOT_TOKEN", "")
@@ -1585,6 +1698,7 @@ def settings():
     bot_service_active = get_telegram_bot_status()
     bot_enabled = bool(settings_data.get("bot_enabled", False)) or bot_service_active
 
+    logger.debug(f"📄 Запрошена страница настроек пользователем {current_user.username}")
     return render_template(
         "settings.html",
         bot_token=bot_token_value,
@@ -1609,14 +1723,15 @@ def api_admins_add():
     payload = request.get_json(silent=True) or {}
     telegram_id = str(payload.get("telegram_id", "")).strip()
     if not telegram_id:
+        logger.warning(f"⚠️ Попытка добавить админа без ID")
         return jsonify({"success": False, "message": "ID не указан."}), 400
-
     admin_info = read_admin_info()
 
     env_values = read_env_values()
     admin_id_value = env_values.get("ADMIN_ID", "")
     admin_ids = parse_admin_ids(admin_id_value)
     if telegram_id in admin_ids:
+        logger.info(f"ℹ️ Администратор {telegram_id} уже в списке")
         return (
             jsonify(
                 {
@@ -1647,6 +1762,7 @@ def api_admins_add():
         "admin_id_value": updated_admin_id_value,
         "bot_service_active": get_telegram_bot_status(),
     }
+    logger.info(f"✅ Администратор {telegram_id} добавлен в список")
     return jsonify(response), 200
 
 
@@ -1656,13 +1772,14 @@ def api_admins_remove():
     payload = request.get_json(silent=True) or {}
     telegram_id = str(payload.get("telegram_id", "")).strip()
     if not telegram_id:
+        logger.warning(f"⚠️ Попытка удалить админа без ID")
         return jsonify({"success": False, "message": "ID не указан."}), 400
-
     admin_info = read_admin_info()
     env_values = read_env_values()
     admin_id_value = env_values.get("ADMIN_ID", "")
     admin_ids = parse_admin_ids(admin_id_value)
     if telegram_id not in admin_ids:
+        logger.warning(f"⚠️ Администратор {telegram_id} не найден в списке")
         return (
             jsonify(
                 {
@@ -1680,6 +1797,7 @@ def api_admins_remove():
         )
 
     if len(admin_ids) <= 1:
+        logger.warning(f"⚠️ Попытка удалить последнего администратора")
         return (
             jsonify(
                 {
@@ -1710,6 +1828,7 @@ def api_admins_remove():
         "admin_id_value": updated_admin_id_value,
         "bot_service_active": get_telegram_bot_status(),
     }
+    logger.info(f"✅ Администратор {telegram_id} удалён из списка")
     return jsonify(response), 200
 
 
@@ -1725,7 +1844,7 @@ def api_system_info():
 def wg():
     """Маршрут клиентов WireGuard"""
     stats = parse_wireguard_output(get_wireguard_stats())
-
+    logger.debug(f"📄 Запрошена страница WireGuard пользователем {current_user.username}")
     return render_template("wg.html", stats=stats, active_page="wg")
 
 
@@ -1736,6 +1855,7 @@ def api_wg_stats():
         stats = parse_wireguard_output(get_wireguard_stats())
         return jsonify(stats)
     except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики WireGuard: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1747,11 +1867,11 @@ def ovpn():
         clients = []
         total_received, total_sent = 0, 0
         errors = []
-
         for file_path, protocol in LOG_FILES:
             file_data, received, sent, error = read_csv(file_path, protocol)
             if error:
                 errors.append(f"Ошибка в файле {file_path}: {error}")
+                logger.warning(f"⚠️ {errors[-1]}")
             else:
                 clients.extend(file_data)
                 total_received += received
@@ -1780,6 +1900,7 @@ def ovpn():
             clients.sort(key=lambda x: x[9], reverse=reverse_order)
 
         total_clients = len(clients)
+        logger.debug(f"📄 Запрошена страница OpenVPN ({total_clients} клиентов)")
         return render_template(
             "ovpn.html",
             clients=clients,
@@ -1800,10 +1921,12 @@ def ovpn():
             "Попробуйте установить правильный часовой пояс "
             "с помощью команды: sudo dpkg-reconfigure tzdata"
         )
+        logger.error(f"❌ Ошибка часового пояса: {error_message}")
         return render_template("ovpn.html", error_message=error_message), 500
 
     except Exception as e:
         error_message = f"Произошла непредвиденная ошибка: {str(e)}"
+        logger.error(f"❌ Ошибка на странице OpenVPN: {e}")
         return render_template("ovpn.html", error_message=error_message), 500
 
 
@@ -1815,7 +1938,6 @@ def ovpn_history():
         conn_logs = sqlite3.connect(app.config["LOGS_DATABASE_PATH"])
         logs_reader = conn_logs.execute("SELECT * from connection_logs").fetchall()
         conn_logs.close()
-
         logs = sorted(
             [
                 {
@@ -1831,6 +1953,7 @@ def ovpn_history():
             reverse=True,  # Сортировка по убыванию
         )
 
+        logger.debug(f"📄 Запрошена история OpenVPN ({len(logs)} записей)")
         return render_template(
             "ovpn_history.html",
             active_section="ovpn",
@@ -1840,6 +1963,7 @@ def ovpn_history():
 
     except Exception as e:
         error_message = f"Произошла непредвиденная ошибка: {str(e)}"
+        logger.error(f"❌ Ошибка на странице истории OpenVPN: {e}")
         return render_template("ovpn_history.html", error_message=error_message), 500
 
 
@@ -1849,7 +1973,6 @@ def ovpn_stats():
     try:
         sort_by = request.args.get("sort", "client_name")
         order = request.args.get("order", "asc").lower()
-
         # Разрешённые поля сортировки (ключ -> SQL)
         allowed_sorts = {
             "client_name": "client_name",
@@ -1876,11 +1999,11 @@ def ovpn_stats():
                            SUM(total_bytes_sent),
                            SUM(total_bytes_received),
                            MAX(last_connected)
-                    FROM monthly_stats
+                     FROM monthly_stats
                     WHERE month = ?
                     GROUP BY client_name
                     ORDER BY {sort_column} {order}
-                """
+                 """
                 rows = conn.execute(query, (month,)).fetchall()
 
                 if rows:
@@ -1898,6 +2021,7 @@ def ovpn_stats():
                         )
                     month_stats[month] = stats_list
 
+        logger.debug(f"📄 Запрошена статистика OpenVPN за {current_month}")
         return render_template(
             "ovpn_stats.html",
             total_received=format_bytes(total_received),
@@ -1913,7 +2037,9 @@ def ovpn_stats():
 
     except Exception as e:
         error_message = f"Произошла непредвиденная ошибка: {e}"
+        logger.error(f"❌ Ошибка на странице статистики OpenVPN: {e}")
         return render_template("ovpn_stats.html", error_message=error_message), 500
+
 
 @app.route("/api/bw")
 @login_required
@@ -1921,7 +2047,6 @@ def api_bw():
     q_iface = request.args.get("iface")
     period = request.args.get("period", "day")
     vnstat_bin = os.environ.get("VNSTAT_BIN", "/usr/bin/vnstat")
-
     # Получаем список интерфейсов
     try:
         proc = subprocess.run(
@@ -1931,10 +2056,13 @@ def api_bw():
         interfaces = [iface["name"] for iface in data.get("interfaces", [])]
     except subprocess.CalledProcessError:
         interfaces = []
+        logger.warning("⚠️ vnstat вернул ошибку при получении интерфейсов")
     except json.JSONDecodeError:
         interfaces = []
+        logger.error("❌ Ошибка парсинга JSON от vnstat")
 
     if not interfaces:
+        logger.error("❌ Нет интерфейсов vnstat")
         return jsonify({"error": "Нет интерфейсов vnstat", "iface": None}), 500
 
     iface = q_iface if q_iface in interfaces else interfaces[0]
@@ -1971,13 +2099,13 @@ def api_bw():
         )
         data = json.loads(proc.stdout)
     except subprocess.CalledProcessError as e:
+        logger.error(f"❌ vnstat вернул код ошибки: {e.returncode}")
         return (
-            jsonify(
-                {"error": f"vnstat вернул код ошибки: {e.returncode}", "iface": iface}
-            ),
+            jsonify({"error": f"vnstat вернул код ошибки: {e.returncode}", "iface": iface}),
             500,
         )
     except Exception as e:
+        logger.error(f"❌ Ошибка получения данных vnstat: {e}")
         return jsonify({"error": str(e), "iface": iface}), 500
 
     # Извлекаем массив данных
@@ -2062,9 +2190,9 @@ def api_interfaces():
     interfaces = get_vnstat_interfaces()
     return jsonify({"interfaces": interfaces})
 
+
 @app.route("/api/cpu")
 def api_cpu():
-
     period = request.args.get("period", "live")
     now = datetime.now()
 
@@ -2124,7 +2252,7 @@ def api_cpu():
                     FROM system_stats
                     WHERE timestamp >= ?
                     ORDER BY timestamp ASC
-                """,
+                 """,
                     (cutoff.strftime("%Y-%m-%d %H:%M:%S"),),
                 )
 
@@ -2141,7 +2269,7 @@ def api_cpu():
                 ]
 
             except Exception as e:
-                print("[DB ERROR] api_cpu:", e)
+                logger.error(f"[DB ERROR] api_cpu: {e}")
                 source_rows = mem_candidates
         else:
             source_rows = mem_candidates
@@ -2166,5 +2294,16 @@ def api_cpu():
 
 
 if __name__ == "__main__":
-    add_admin()
+    logger.info("=" * 60)
+    logger.info("🚀 ЗАПУСК MAIN.PY (Flask приложение)")
+    logger.info("=" * 60)
+    logger.info(f"📍 Версия Python: {sys.version}")
+    logger.info(f"🌐 Запуск на порту: 1234")
+    logger.info(f"📁 Путь к логам: {LOG_DIR}")
+    
+    admin_pass = add_admin()
+    if admin_pass:
+        logger.info(f"✅ Администратор создан/обновлён")
+    
+    logger.info("📡 Запуск Flask сервера...")
     app.run(debug=False, host="0.0.0.0", port=1234)

@@ -7,6 +7,7 @@ class Config:
     SECRET_KEY = os.environ.get("SECRET_KEY") or "supersecretkey"
     DATABASE_PATH = os.path.join(BASE_DIR, "data", "databases", "db.db")
     LOGS_DATABASE_PATH = os.path.join(BASE_DIR, "data", "databases", "openvpn_logs.db")
+    LOGS_PATH = os.path.join(BASE_DIR, "data", "logs")
     WG_STATS_PATH = os.path.join(BASE_DIR, "data", "databases", "wireguard_stats.db")
     SYSTEM_STATS_PATH = os.path.join(BASE_DIR, "data", "databases", "system_stats.db")
     ENV_PATH = os.path.join(BASE_DIR, "data", ".env")

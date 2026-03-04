@@ -8,6 +8,7 @@ import requests
 import asyncio
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -35,8 +36,19 @@ from main import (
 )
 
 # ============================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ С РАЗДЕЛЕНИЕМ ПО УРОВНЯМ
+# НАСТРОЙКА ЛОГИРОВАНИЯ С РАЗДЕЛЕНИЕМ ПО УРОВНЯМ И РОТАЦИЕЙ ФАЙЛОВ
 # ============================================================================
+
+# Берем путь к папке Logs из конфиг файла
+LOG_DIR = Config.LOGS_PATH
+
+# Полные пути к файлам логов
+STDOUT_LOG = os.path.join(LOG_DIR, 'vpn_bot.stdout.log')
+STDERR_LOG = os.path.join(LOG_DIR, 'vpn_bot.stderr.log')
+
+# Параметры ротации
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 МБ
+BACKUP_COUNT = 5                 # Хранить 5 последних файлов
 
 # Очищаем ВСЕ обработчики корневого логгера (важно!)
 for handler in logging.root.handlers[:]:
@@ -64,7 +76,14 @@ logger.handlers.clear()
 # ============================================================================
 # ФАЙЛ ДЛЯ WARNING, ERROR, CRITICAL (stderr)
 # ============================================================================
-stderr_handler = logging.FileHandler('vpn_bot.stderr.log', encoding='utf-8')
+stderr_handler = RotatingFileHandler(
+    STDERR_LOG, 
+    maxBytes=MAX_LOG_SIZE,
+    backupCount=BACKUP_COUNT,
+    encoding='utf-8',
+    delay=True
+)
+stderr_handler = logging.FileHandler(STDERR_LOG, encoding='utf-8')
 stderr_handler.setLevel(logging.WARNING)  # Только WARNING и выше
 stderr_handler.addFilter(LevelFilter(logging.WARNING, logging.CRITICAL))
 stderr_formatter = logging.Formatter(
@@ -76,7 +95,14 @@ stderr_handler.setFormatter(stderr_formatter)
 # ============================================================================
 # ФАЙЛ ДЛЯ INFO, DEBUG (stdout)
 # ============================================================================
-stdout_handler = logging.FileHandler('vpn_bot.stdout.log', encoding='utf-8')
+stdout_handler = RotatingFileHandler(
+    STDOUT_LOG, 
+    maxBytes=MAX_LOG_SIZE,
+    backupCount=BACKUP_COUNT,
+    encoding='utf-8',
+    delay=True
+)
+stdout_handler = logging.FileHandler(STDOUT_LOG, encoding='utf-8')
 stdout_handler.setLevel(logging.DEBUG)  # DEBUG и INFO
 stdout_handler.addFilter(LevelFilter(logging.DEBUG, logging.INFO))
 stdout_formatter = logging.Formatter(
@@ -115,6 +141,7 @@ dp = Dispatcher()
 # ФУНКЦИИ РАБОТЫ С НАСТРОЙКАМИ
 # ============================================================================
 def load_settings():
+    """Загружает настройки из JSON файла."""
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
             data = json.load(settings_file)
@@ -131,29 +158,32 @@ def load_settings():
     if not isinstance(data, dict):
         logger.warning("Данные настроек не являются словарём, инициализирую пустой dict")
         data = {}
-    
+
     data.setdefault("telegram_admins", {})
     data.setdefault("telegram_clients", {})
-    
+
     if not isinstance(data.get("telegram_admins"), dict):
         data["telegram_admins"] = {}
     if not isinstance(data.get("telegram_clients"), dict):
         data["telegram_clients"] = {}
-    
+
     return data
 
 
 def save_settings(data):
+    """Сохраняет настройки в JSON файл."""
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as settings_file:
             json.dump(data, settings_file, ensure_ascii=False, indent=4)
             settings_file.write("\n")
-        logger.debug(f"Настройки сохранены: {SETTINGS_PATH}")
+        logger.debug(f"✅ Настройки сохранены: {SETTINGS_PATH}")
     except Exception as e:
-        logger.error(f"Ошибка сохранения настроек: {e}")
+        logger.error(f"❌ Ошибка сохранения настроек: {e}")
 
 
 def read_env_values():
+    """Читает переменные окружения из .env файла."""
+    logger.debug(f"Чтение .env файла: {ENV_PATH}")
     values = {}
     try:
         with open(ENV_PATH, "r", encoding="utf-8") as env_file:
@@ -163,6 +193,7 @@ def read_env_values():
                     continue
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
+        logger.debug(f"✅ Прочитано {len(values)} переменных из .env")
     except FileNotFoundError:
         logger.warning(f"Файл .env не найден: {ENV_PATH}")
     except Exception as e:
@@ -171,13 +202,16 @@ def read_env_values():
 
 
 def update_env_values(updates):
+    """Обновляет переменные окружения в .env файле."""
     updates = {key: value for key, value in updates.items() if key}
     if not updates:
+        logger.debug("Нет обновлений для .env файла")
         return
     
+    logger.info(f"📝 Обновление .env: {list(updates.keys())}")
     updated_keys = set()
     lines = []
-    
+
     try:
         with open(ENV_PATH, "r", encoding="utf-8") as env_file:
             lines = env_file.readlines()
@@ -209,9 +243,9 @@ def update_env_values(updates):
     try:
         with open(ENV_PATH, "w", encoding="utf-8") as env_file:
             env_file.writelines(new_lines)
-        logger.debug(f"Обновлены ключи в .env: {list(updates.keys())}")
+        logger.info(f"✅ Обновлены ключи в .env: {list(updates.keys())}")
     except Exception as e:
-        logger.error(f"Ошибка записи в .env файл: {e}")
+        logger.error(f"❌ Ошибка записи в .env файл: {e}")
 
 
 def update_admin_info(user: types.User):
@@ -279,10 +313,62 @@ def get_client_mapping():
 
 
 def get_client_name_for_user(user_id: int):
+    """Получает имя клиента для пользователя (возвращает первый профиль)."""
     profiles = get_client_mapping().get(str(user_id), [])
     if isinstance(profiles, list):
-        return profiles[0] if profiles else None  # Возвращаем первый для совместимости
+        return profiles[0] if profiles else None
     return profiles
+
+def get_client_info_for_user(user_id: int):
+    """Получает полную информацию о профилях пользователя с датами истечения."""
+    profiles = get_client_mapping().get(str(user_id), [])
+    if not profiles:
+        return []
+    
+    if not isinstance(profiles, list):
+        profiles = [profiles]
+    
+    # Получаем список всех клиентов OpenVPN с датами
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        clients = loop.run_until_complete(get_clients("openvpn"))
+    except:
+        clients = []
+    
+    result = []
+    for profile in profiles:
+        client_info = {
+            "name": profile,
+            "expire": None
+        }
+        # Ищем совпадение в списке клиентов
+        for client in clients:
+            if isinstance(client, dict) and client.get("name") == profile:
+                client_info["expire"] = client.get("expire")
+                break
+        result.append(client_info)
+    
+    return result
+
+
+def create_user_profile_menu(profiles: list):
+    """Создает меню выбора профиля для обычного пользователя."""
+    buttons = []
+    
+    for profile in profiles:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🔐 {profile}",
+                callback_data=f"user_select_profile_{profile}"
+            )
+        ])
+    
+    buttons.append([
+        InlineKeyboardButton(text="ℹ️ Моя информация", callback_data="user_my_info")
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def set_client_mapping(telegram_id: str, client_name: str):
@@ -322,11 +408,13 @@ def set_client_mapping(telegram_id: str, client_name: str):
 
 
 def remove_client_mapping(telegram_id: str, client_name: str = None):
+    """Удаляет привязку клиента."""
     try:
         client_map = get_client_mapping()
         telegram_id = str(telegram_id)
         
         if telegram_id not in client_map:
+            logger.warning(f"⚠️ Привязка не найдена для удаления: {telegram_id}")
             return False
             
         existing_profiles = client_map[telegram_id]
@@ -337,10 +425,13 @@ def remove_client_mapping(telegram_id: str, client_name: str = None):
             # Удаляем конкретный профиль
             if client_name in existing_profiles:
                 existing_profiles.remove(client_name)
+                logger.info(f"✅ Удалена привязка: {telegram_id} → {client_name}")
             else:
+                logger.warning(f"⚠️ Профиль не найден: {client_name}")
                 return False
         else:
             # Если профиль не указан, удаляем все привязки пользователя
+            logger.info(f"✅ Удалены все привязки пользователя: {telegram_id}")
             existing_profiles = []
         
         if existing_profiles:
@@ -359,10 +450,9 @@ def remove_client_mapping(telegram_id: str, client_name: str = None):
         
         serialized = ",".join(serialized_items) if serialized_items else ""
         update_env_values({CLIENT_MAPPING_KEY: serialized})
-        logger.info(f"Удалена привязка клиента: {telegram_id} → {client_name or 'все'}")
         return True
     except Exception as e:
-        logger.error(f"Ошибка удаления привязки клиента: {e}")
+        logger.error(f"❌ Ошибка удаления привязки клиента: {e}")
         return False
 
 
@@ -511,7 +601,7 @@ async def update_bot_description():
     try:
         async with Bot(token=BOT_TOKEN) as bot_temp:
             await bot_temp.set_my_description(BOT_DESCRIPTION, language_code="ru")
-            logger.info("Описание бота обновлено")
+            logger.info("✅ Описание бота обновлено")
     except Exception as e:
         logger.error(f"Ошибка обновления описания бота: {e}")
 
@@ -524,7 +614,7 @@ async def update_bot_about():
     try:
         async with Bot(token=BOT_TOKEN) as bot_temp:
             await bot_temp.set_my_short_description(BOT_ABOUT, language_code="ru")
-            logger.info("Раздел «О боте» обновлён")
+            logger.info("✅ Раздел «О боте» обновлён")
     except Exception as e:
         logger.error(f"Ошибка обновления раздела «О боте»: {e}")
 
@@ -539,7 +629,7 @@ async def set_bot_commands():
                 BotCommand(command="client", description="Привязать клиента к ID"),
             ]
             await bot_temp.set_my_commands(commands)
-            logger.info("Команды бота установлены")
+            logger.info("✅ Команды бота установлены")
     except Exception as e:
         logger.error(f"Ошибка установки команд бота: {e}")
 
@@ -758,9 +848,9 @@ def create_client_menu(client_name: str):
                 InlineKeyboardButton(
                     text="OpenVPN", callback_data=f"client_openvpn_{client_name}"
                 ),
-                InlineKeyboardButton(
-                    text="WireGuard", callback_data=f"client_wireguard_{client_name}"
-                ),
+#                InlineKeyboardButton(
+#                    text="WireGuard", callback_data=f"client_wireguard_{client_name}"
+#                ),
             ],
         ]
     )
@@ -793,17 +883,171 @@ def create_notifications_menu(user_id: int):
 
 
 async def show_client_menu(message: types.Message, user_id: int):
-    client_name = get_client_name_for_user(user_id)
-    if not client_name:
+    """Показывает меню клиента с информацией о сроке действия."""
+    client_info = get_client_info_for_user(user_id)
+    
+    if not client_info:
         await message.answer(
             "Доступ запрещен. Передайте администратору ваш ID: "
-            f"`{user_id}`"
+            f"<code>{user_id}</code>"
         )
         return
-    await message.answer(
-        f'Ваш клиент: "{client_name}". Выберите протокол:',
-        reply_markup=create_client_menu(client_name),
+    
+    # Формируем текст с информацией о профилях
+    profiles_text = ""
+    for i, info in enumerate(client_info, 1):
+        profile_name = info.get("name", "Неизвестно")
+        expire_date = info.get("expire")
+        
+        if expire_date and expire_date != "unknown":
+            # Рассчитываем оставшиеся дни
+            try:
+                from datetime import datetime
+                exp_date = datetime.strptime(expire_date, "%d-%m-%Y").date()
+                days_left = (exp_date - datetime.now().date()).days
+                
+                if days_left < 0:
+                    status = "❌ Истёк"
+                elif days_left <= 7:
+                    status = f"⚠️ {days_left} дн."
+                elif days_left <= 30:
+                    status = f"⏳ {days_left} дн."
+                else:
+                    status = f"✅ {days_left} дн."
+                
+                profiles_text += f"{i}. 🔐 {profile_name} (до {expire_date}) {status}\n"
+            except:
+                profiles_text += f"{i}. 🔐 {profile_name} (до {expire_date})\n"
+        else:
+            profiles_text += f"{i}. 🔐 {profile_name} (срок не указан)\n"
+    
+    if len(client_info) == 1:
+        # Если профиль один, сразу показываем меню
+        client_name = client_info[0]["name"]
+        await message.answer(
+            f'✅ <b>Ваш профиль:</b>\n{profiles_text}\n'
+            f'Ваш Telegram ID: <code>{user_id}</code>\n\n'
+            f'<b>Выберите действие:</b>',
+            reply_markup=create_client_menu(client_name)
+        )
+    else:
+        # Если профилей несколько, показываем выбор
+        buttons = []
+        for info in client_info:
+            profile_name = info.get("name", "Неизвестно")
+            expire_date = info.get("expire")
+            
+            if expire_date and expire_date != "unknown":
+                btn_text = f"🔐 {profile_name} (до {expire_date})"
+            else:
+                btn_text = f"🔐 {profile_name}"
+            
+            buttons.append([
+                InlineKeyboardButton(
+                    text=btn_text,
+                    callback_data=f"user_select_profile_{profile_name}"
+                )
+            ])
+        
+        buttons.append([
+            InlineKeyboardButton(text="ℹ️ Моя информация", callback_data="user_my_info")
+        ])
+        
+        await message.answer(
+            f'✅ <b>Найдено профилей:</b> {len(client_info)}\n\n'
+            f'{profiles_text}\n'
+            f'Ваш Telegram ID: <code>{user_id}</code>\n\n'
+            f'<b>Выберите профиль для подключения:</b>',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+
+@dp.callback_query(lambda c: c.data.startswith("user_select_profile_"))
+async def handle_user_profile_selection(callback: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает выбор профиля обычным пользователем."""
+    if callback.from_user.id in ADMIN_ID:
+        await callback.answer("Это меню для клиентов", show_alert=True)
+        return
+    
+    profile_name = callback.data.replace("user_select_profile_", "", 1)
+    
+    # Проверяем, что профиль действительно привязан к этому пользователю
+    client_info = get_client_info_for_user(callback.from_user.id)
+    profile_info = None
+    for info in client_info:
+        if info.get("name") == profile_name:
+            profile_info = info
+            break
+    
+    if not profile_info:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+        return
+    
+    # Формируем текст с информацией о сроке действия
+    expire_date = profile_info.get("expire")
+    expire_text = ""
+    if expire_date and expire_date != "unknown":
+        try:
+            from datetime import datetime
+            exp_date = datetime.strptime(expire_date, "%d-%m-%Y").date()
+            days_left = (exp_date - datetime.now().date()).days
+            
+            if days_left < 0:
+                expire_text = f"📅 Срок действия: <b>❌ Истёк</b> ({expire_date})"
+            elif days_left <= 7:
+                expire_text = f"📅 Срок действия: <b>⚠️ {days_left} дн.</b> ({expire_date})"
+            elif days_left <= 30:
+                expire_text = f"📅 Срок действия: <b>⏳ {days_left} дн.</b> ({expire_date})"
+            else:
+                expire_text = f"📅 Срок действия: <b>✅ {days_left} дн.</b> ({expire_date})"
+        except:
+            expire_text = f"📅 Срок действия: {expire_date}"
+    else:
+        expire_text = "📅 Срок действия: не указан"
+    
+    await callback.message.edit_text(
+        f'✅ <b>Выбран профиль:</b> {profile_name}\n\n'
+        f'Ваш Telegram ID: <code>{callback.from_user.id}</code>\n\n'
+        f'{expire_text}\n\n'
+        f'<b>Выберите протокол подключения:</b>',
+        reply_markup=create_client_menu(profile_name)
     )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "user_my_info")
+async def handle_user_my_info(callback: types.CallbackQuery):
+    """Показывает пользователю информацию о его привязках."""
+    if callback.from_user.id in ADMIN_ID:
+        await callback.answer("Это меню для клиентов", show_alert=True)
+        return
+    
+    profiles = get_client_name_for_user(callback.from_user.id, all_profiles=True)
+    
+    if not profiles:
+        await callback.answer("❌ Профили не найдены", show_alert=True)
+        return
+    
+    info_text = (
+        f"ℹ️ <b>Ваша информация</b>\n\n"
+        f"🔢 Telegram ID: <code>{callback.from_user.id}</code>\n"
+        f"👤 Имя: {callback.from_user.first_name}\n"
+        f"📊 Количество профилей: {len(profiles)}\n\n"
+        f"<b>Ваши профили:</b>\n"
+    )
+    
+    for i, profile in enumerate(profiles, 1):
+        info_text += f"{i}. 🔐 {profile}\n"
+    
+    await callback.message.answer(
+        info_text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к профилям", callback_data="start")]
+            ]
+        )
+    )
+    await callback.answer()
 
 
 def get_user_label(telegram_id: str) -> str:
@@ -965,8 +1209,10 @@ def create_client_list_keyboard(clients, page, total_pages, vpn_type, action):
                 
                 if days_left < 0:
                     status = "❌ Истёк"
+                elif days_left <= 7:
+                    status = "⚠️ Истекает"
                 elif days_left <= 30:
-                    status = "⚠️ Скоро"
+                    status = "⏳️ Скоро"
                 else:
                     status = "✅"
                 
@@ -1028,8 +1274,10 @@ async def execute_script(option: str, client_name: str = None, days: str = None)
     """Выполняет shell-скрипт для управления VPN-клиентами."""
     script_path = os.path.join(os.path.dirname(__file__), '../scripts/client.sh')
     
+    logger.info(f"🔧 Выполнение скрипта: option={option}, client={client_name}, days={days}")
+    
     if not os.path.exists(script_path):
-        logger.error(f"Файл {script_path} не найден!")
+        logger.error(f"❌ Файл {script_path} не найден!")
         return {
             "returncode": 1,
             "stdout": "",
@@ -1042,6 +1290,8 @@ async def execute_script(option: str, client_name: str = None, days: str = None)
         command += f" {client_name}"
         if option == "1" and days:
             command += f" {days}"
+
+    logger.debug(f"📝 Команда: {command}")
 
     try:
         env = os.environ.copy()
@@ -1056,27 +1306,34 @@ async def execute_script(option: str, client_name: str = None, days: str = None)
 
         stdout, stderr = await process.communicate()
         logger.debug(f"Скрипт выполнен: option={option}, returncode={process.returncode}")
+        
+        if process.returncode != 0:
+            logger.error(f"❌ Ошибка скрипта: {stderr.decode().strip()}")
+        
         return {
             "returncode": process.returncode,
             "stdout": stdout.decode().strip(),
             "stderr": stderr.decode().strip(),
         }
     except Exception as e:
-        logger.error(f"Ошибка при выполнении скрипта: {e}")
+        logger.error(f"❌ Ошибка при выполнении скрипта: {e}")
         return {
             "returncode": 1,
             "stdout": "",
             "stderr": f"❌ Ошибка при выполнении скрипта: {str(e)}",
         }
 
-
 async def send_single_config(chat_id: int, path: str, caption: str):
+    """Отправляет конфигурационный файл пользователю."""
     if os.path.exists(path):
+        logger.info(f"📤 Отправка конфига пользователю {chat_id}: {os.path.basename(path)}")
         await bot.send_document(
             chat_id, document=FSInputFile(path), caption=f"🔐 {caption}"
         )
         return True
-    return False
+    else:
+        logger.warning(f"⚠️ Файл не найден для отправки: {path}")
+        return False
 
 
 # ============================================================================
@@ -1085,30 +1342,38 @@ async def send_single_config(chat_id: int, path: str, caption: str):
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     """Обрабатывает команду /start и отображает главное меню."""
+    user_id = message.from_user.id
+    username = message.from_user.username or "N/A"
+    logger.info(f"📩 Команда /start от пользователя: {user_id} (@{username})")
+    
     update_admin_info(message.from_user)
+    
     if not ADMIN_ID:
+        logger.warning(f"⚠️ ADMIN_ID не настроен. Первый запуск от {user_id}")
         await message.answer(
             "Администраторы еще не настроены.\n"
-            "Ваш ID для настройки: "
-            f"`{message.from_user.id}`\n"
+            f"Ваш ID для настройки: `{message.from_user.id}`\n"
             "Добавьте его в переменную ADMIN_ID в .env."
         )
         await state.clear()
         return
     
     if message.from_user.id in ADMIN_ID:
+        logger.info(f"✅ Администратор {user_id} вошёл в главное меню")
         await message.answer("Главное меню:", reply_markup=create_main_menu())
         await state.set_state(VPNSetup.choosing_option)
         return
 
     client_name = get_client_name_for_user(message.from_user.id)
     if not client_name:
+        logger.warning(f"❌ Отказано в доступе пользователю {user_id} - нет привязки")
         await message.answer(
             "Доступ запрещен. Передайте администратору ваш ID: "
             f"<code>{message.from_user.id}</code>"
         )
         return
 
+    logger.info(f"✅ Клиент {user_id} получил доступ к профилю: {client_name}")
     await show_client_menu(message, message.from_user.id)
     await state.clear()
 
@@ -1197,7 +1462,7 @@ async def notify_admin_server_online():
             if not is_admin_notification_enabled(admin):
                 continue
             await bot.send_message(admin, text, parse_mode="HTML")
-            logger.info(f"Уведомление отправлено админу {admin}")
+            logger.info(f"✅ Уведомление отправлено админу {admin}")
         except Exception as e:
             logger.error(f"Ошибка отправки уведомления админу {admin}: {e}")
 
@@ -1238,17 +1503,24 @@ async def handle_main_menus(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("clientmap_"))
 async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_ID:
+    """Обработчик действий с привязками клиентов."""
+    admin_id = callback.from_user.id
+    data = callback.data
+    
+    if admin_id not in ADMIN_ID:
+        logger.warning(f"❌ Несанкционированный доступ к клиентским привязкам от {admin_id}")
         await callback.answer("Доступ запрещен!", show_alert=True)
         return
     
-    data = callback.data
+    logger.info(f"🔧 Админ {admin_id} выполняет действие: {data}")
 
     if data in ["wireguard_menu", "7", "8"]:
+        logger.debug(f"⛔ Функция отключена: {data}")
         await callback.answer("⛔ Эта функция отключена", show_alert=True)
         return
 
     if data == "clientmap_select_user":
+        logger.debug("👤 Админ начал процесс выбора пользователя для привязки")
         await callback.message.edit_text(
             "👤 <b>Привязка профиля к пользователю</b>\n\n"
             "Чтобы получить ID пользователя:\n"
@@ -1266,6 +1538,7 @@ async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMCont
         return
 
     if data == "clientmap_add":
+        logger.debug("➕ Админ выбрал ручное добавление привязки")
         await callback.message.edit_text(
             "Отправьте привязку в формате:\n"
             "<code>client_id:имя_клиента</code>\n"
@@ -1285,6 +1558,7 @@ async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMCont
         parts = data.replace("clientmap_delete_confirm_", "").split("_", 1)
         if len(parts) == 2:
             telegram_id, profile = parts
+            logger.info(f"🗑️ Удаление привязки: {telegram_id} → {profile}")
             remove_client_mapping(telegram_id, profile)
             await callback.message.edit_text("Привязка удалена.", reply_markup=create_clients_menu())
         await callback.answer()
@@ -1295,6 +1569,7 @@ async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMCont
         parts = data.replace("clientmap_", "").split("_", 1)
         if len(parts) == 2:
             telegram_id, profile = parts
+            logger.debug(f"📋 Просмотр привязки: {telegram_id} → {profile}")
             await callback.message.edit_text(
                 f"Удалить привязку <code>{get_user_label(telegram_id)}</code> → "
                 f"<b>{profile}</b>?",
@@ -1655,12 +1930,12 @@ async def handle_client_selection(callback: types.CallbackQuery, state: FSMConte
         await callback.answer("⏳ Генерация конфигурации...")
         await send_ovpn_udp_config(callback, "vpn", client_name, state)
         return
-    else:
-        await callback.message.edit_text(
-            "Выберите тип конфигурации WireGuard:",
-            reply_markup=create_wireguard_config_menu(client_name, back_callback),
-        )
-        await state.set_state(VPNSetup.choosing_config_type)
+#    else:
+#        await callback.message.edit_text(
+#            "Выберите тип конфигурации WireGuard:",
+#            reply_markup=create_wireguard_config_menu(client_name, back_callback),
+#        )
+#        await state.set_state(VPNSetup.choosing_config_type)
     
     await callback.answer()
 
@@ -2578,7 +2853,7 @@ async def get_wireguard_online_clients():
 
 async def get_online_clients_text():
     openvpn_clients = get_openvpn_online_clients()
-    wg_clients = await get_wireguard_online_clients()
+#    wg_clients = await get_wireguard_online_clients()
     
     lines = ["<b>👥 Кто онлайн:</b>", ""]
     
@@ -2603,6 +2878,9 @@ async def get_online_clients_text():
 # МОНИТОРИНГ НАГРУЗКИ
 # ============================================================================
 async def monitor_server_load():
+    """Мониторинг нагрузки сервера с логированием."""
+    logger.info("📊 Задача мониторинга нагрузки запущена")
+    
     while True:
         await asyncio.sleep(LOAD_CHECK_INTERVAL)
         if not ADMIN_ID:
@@ -2611,17 +2889,23 @@ async def monitor_server_load():
         try:
             cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 1)
             memory_percent = psutil.virtual_memory().percent
+            
+            logger.debug(f"📈 Нагрузка: CPU={cpu_percent}%, RAM={memory_percent}%")
+            
         except Exception as e:
-            logger.error(f"Ошибка проверки нагрузки: {e}")
+            logger.error(f"❌ Ошибка проверки нагрузки: {e}")
             continue
 
         cpu_threshold, memory_threshold = get_load_thresholds()
+        
         if cpu_percent < cpu_threshold and memory_percent < memory_threshold:
             continue
 
+        logger.warning(f"⚠️ Высокая нагрузка обнаружена: CPU={cpu_percent}%, RAM={memory_percent}%")
+        
         now_ts = time.time()
         alert_text = (
-            "<b>⚠️ Высокая нагрузка на сервер</b>\n\n"
+            f"<b>⚠️ Высокая нагрузка на сервер</b>\n\n"
             f"{get_color_by_percent(cpu_percent)} <b>ЦП:</b> {cpu_percent:>5}%\n"
             f"{get_color_by_percent(memory_percent)} <b>ОЗУ:</b> {memory_percent:>5}%"
         )
@@ -2631,16 +2915,18 @@ async def monitor_server_load():
                 continue
             if not is_admin_load_notification_enabled(admin):
                 continue
+            
             last_sent = last_load_alerts.get(admin, 0)
             if now_ts - last_sent < LOAD_ALERT_COOLDOWN:
+                logger.debug(f"⏳ Пропуск уведомления для админа {admin} (cooldown)")
                 continue
             
             try:
                 await bot.send_message(admin, alert_text, parse_mode="HTML")
                 last_load_alerts[admin] = now_ts
-                logger.info(f"Уведомление о нагрузке отправлено админу {admin}")
+                logger.info(f"✅ Уведомление о нагрузке отправлено админу {admin}")
             except Exception as e:
-                logger.error(f"Ошибка отправки уведомления о нагрузке админу {admin}: {e}")
+                logger.error(f"❌ Ошибка отправки уведомления о нагрузке админу {admin}: {e}")
 
 
 def get_main_interface():
@@ -2683,22 +2969,40 @@ def format_vpn_clients(clients_dict):
 # ============================================================================
 async def main():
     """Главная функция для запуска бота."""
-    logger.info("✅ Бот успешно запущен!")
+    logger.info("=" * 60)
+    logger.info("🚀 ЗАПУСК VPN BOT")
+    logger.info("=" * 60)
+    logger.info(f"📍 Версия Python: {sys.version}")
+    logger.info(f"👥 Администраторы: {ADMIN_ID}")
+    logger.info(f"🌐 IP сервера: {SERVER_IP}")
+    
     try:
         await update_bot_description()
+       
         await notify_admin_server_online()
+        
         await update_bot_about()
+        
         await set_bot_commands()
+        
         asyncio.create_task(monitor_server_load())
+        logger.info("✅ Мониторинг нагрузки запущен")
+        
+        logger.info("📡 Запуск polling...")
         await dp.start_polling(bot)
+        
     except KeyboardInterrupt:
-        logger.info("\n🛑 Бот остановлен пользователем")
+        logger.info("\n🛑 Бот остановлен пользователем (Ctrl+C)")
     except Exception as e:
-        logger.critical(f"Критическая ошибка в main: {e}")
+        logger.critical(f"❌ Критическая ошибка в main: {e}", exc_info=True)
     finally:
         await bot.close()
-        logger.info("Бот закрыт")
-
+        logger.info("🔒 Бот закрыт, соединения разорваны")
+        logger.info("=" * 60)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.critical(f"❌ Фатальная ошибка при запуске: {e}", exc_info=True)
+        sys.exit(1)
