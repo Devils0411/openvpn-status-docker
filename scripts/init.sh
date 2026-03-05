@@ -241,11 +241,6 @@ setup_https() {
     config_content=$(cat <<EOF
 # Created by StatusOpenVPN
 server {
-    listen 80;
-    server_name $domain;
-    return 301 https://\$host:$https_port\$request_uri;
-}
-server {
     listen $https_port ssl;
     server_name $domain;
     ssl_certificate     $CERT_PATH;
@@ -375,6 +370,12 @@ command=/bin/sh -c "sleep 30 && while true; do /usr/local/bin/python $ROOT_DIR/s
 directory=$ROOT_DIR/src
 autostart=true
 autorestart=true
+stdout_logfile=$LOGS_DIR/logs.stdout.log
+stderr_logfile=$LOGS_DIR/logs.stderr.log
+stdout_logfile_maxbytes=10MB
+stderr_logfile_maxbytes=10MB
+stdout_logfile_backups=5
+stderr_logfile_backups=5
 EOF
     
     echo -e "${GREEN}Базовая настройка Supervisord завершена.${RESET}"
@@ -419,6 +420,12 @@ autorestart=true
 startretries=3
 startsecs=300
 restartpause=10
+stdout_logfile=$LOGS_DIR/vpn_bot.stdout.log
+stderr_logfile=$LOGS_DIR/vpn_bot.stderr.log
+stdout_logfile_maxbytes=10MB
+stderr_logfile_maxbytes=10MB
+stdout_logfile_backups=5
+stderr_logfile_backups=5
 EOF
     
     if [ ! -f "$ENV_FILE" ]; then
