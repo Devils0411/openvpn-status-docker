@@ -125,6 +125,59 @@ copy_letsencrypt_cert() {
     CERT_TYPE="letsencrypt"
 }
 
+# ✅ ЕДИНАЯ ФУНКЦИЯ: Проверка срока действия сертификата
+# Возвращает: 0 = валиден, 1 = ошибка/не существует, 2 = истёк или скоро истечёт
+check_cert_expiry() {
+    local cert_path=$1
+    local min_days=${2:-30}
+
+    if [[ ! -f "$cert_path" ]]; then
+        return 1
+    fi
+
+    local expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+    if [[ -z "$expiry" ]]; then
+        return 1
+    fi
+
+    local expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
+    local now=$(date +%s)
+    local days_left=$(( (expiry_epoch - now) / 86400 ))
+
+    if [[ $days_left -lt 0 ]]; then
+        echo -e "${RED}⚠️  Сертификат истёк ${days_left#-} дней назад${RESET}"
+        return 2
+    elif [[ $days_left -lt $min_days ]]; then
+        echo -e "${YELLOW}⚠️  Сертификат истекает через $days_left дней (менее $min_days)${RESET}"
+        return 2
+    else
+        echo -e "${GREEN}✅ Сертификат действителен ещё $days_left дней${RESET}"
+        return 0
+    fi
+}
+
+# ✅ Проверка существующего сертификата (файлы + срок действия)
+validate_existing_cert() {
+    local domain=$1
+    local le_cert_path="$HTTPS_LE_DIR/${domain}_fullchain.pem"
+    local le_key_path="$HTTPS_LE_DIR/${domain}_privkey.pem"
+
+    # Проверяем наличие файлов в $HTTPS_LE_DIR
+    if [[ ! -f "$le_cert_path" ]] || [[ ! -f "$le_key_path" ]]; then
+        echo -e "${YELLOW}ℹ️  Файлы сертификата не найдены в $HTTPS_LE_DIR${RESET}"
+        return 1
+    fi
+
+    # ✅ Используем единую функцию check_cert_expiry для проверки срока
+    if check_cert_expiry "$le_cert_path" 30; then
+        echo -e "${GREEN}✅ Существующий сертификат валиден и будет использован${RESET}"
+        return 0
+    else
+        echo -e "${YELLOW}⚠️  Требуется обновление сертификата${RESET}"
+        return 1
+    fi
+}
+
 check_nginx_configs() {
     local sites_available="/etc/nginx/sites-available"
     local target_domain=$1
@@ -202,11 +255,14 @@ setup_https() {
     if [[ "$use_self_signed" == "true" ]]; then
         generate_self_signed_cert "$domain" "$server_ip"
     else
-        if certbot certificates 2>/dev/null | grep -q "Domains: $domain"; then
-            echo -e "${GREEN}Сертификат уже существует для $domain${RESET}"
-            copy_letsencrypt_cert "$domain"
+        # ✅ ИЗМЕНЕННАЯ ЛОГИКА: Проверяем сертификат в $HTTPS_LE_DIR перед запросом нового
+        if validate_existing_cert "$domain"; then
+            echo -e "${GREEN}📋 Используем существующий валидный сертификат из $HTTPS_LE_DIR${RESET}"
+            CERT_PATH="$HTTPS_LE_DIR/${domain}_fullchain.pem"
+            KEY_PATH="$HTTPS_LE_DIR/${domain}_privkey.pem"
+            CERT_TYPE="letsencrypt"
         else
-            echo -e "${YELLOW}Получение нового сертификата от Let's Encrypt...${RESET}"
+            echo -e "${YELLOW}🔒 Получение нового сертификата от Let's Encrypt...${RESET}"
             EMAIL="admin@$domain"
             certbot --nginx -d "$domain" --email "$EMAIL" --agree-tos --non-interactive || {
                 echo -e "${RED}Certbot завершился ошибкой. Переключаемся на самоподписанный сертификат...${RESET}"
@@ -486,11 +542,13 @@ RENEW_THRESHOLD=30
 CHECK_INTERVAL=86400
 
 log() { 
-    echo -e "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+    echo -e "$(date '+%d-%m-%Y %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
-check_cert() {
+# ✅ ЕДИНАЯ ФУНКЦИЯ ПРОВЕРКИ (как в основном скрипте)
+check_cert_expiry() {
     local cert_path=$1
+    local min_days=${2:-30}
     [[ ! -f "$cert_path" ]] && return 1
     local expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
     [[ -z "$expiry" ]] && return 1
@@ -498,18 +556,16 @@ check_cert() {
     local now=$(date +%s)
     local days=$(( (expiry_epoch - now) / 86400 ))
     log "ℹ️ Сертификат истекает через $days дней"
-    [[ $days -lt 0 ]] && return 1
-    [[ $days -lt $RENEW_THRESHOLD ]] && return 2
+    [[ $days -lt 0 ]] && return 2
+    [[ $days -lt $min_days ]] && return 2
     return 0
 }
-
 renew_cert() {
     local domain=$1
-    log "🔄 Обновляем сертифкат для домена $domain..."
+    log "🔄 Обновляем сертификат для домена $domain..."
     certbot renew --non-interactive --quiet 2>/dev/null || return 1
     log "✅ Сертификат обновлен"
 }
-
 copy_certs() {
     local domain=$1
     local src_cert="/etc/letsencrypt/live/$domain/fullchain.pem"
@@ -523,24 +579,22 @@ copy_certs() {
     chmod 600 "$dst_dir/${domain}_privkey.pem"
     log "✅ Сертификат скопирован"
 }
-
 reload_nginx() {
     nginx -t 2>/dev/null || return 1
     supervisorctl restart nginx 2>/dev/null || systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null || return 1
     log "✅ Nginx перезапущен"
 }
-
 # Main Loop
 [[ ! -f "$ENV_FILE" ]] && { log "❌ .env не найден"; exit 1; }
 DOMAIN=$(grep "^DOMAIN=" "$ENV_FILE" 2>/dev/null | cut -d= -f2)
 [[ -z "$DOMAIN" ]] && { log "❌ Домен не настроен"; exit 1; }
 log "🔒 Монитор сертификата для $DOMAIN запущен"
-
 while true; do
+    # ✅ ПРОВЕРЯЕМ СЕРТИФИКАТ В $HTTPS_LE_DIR
     cert_file="$HTTPS_LE_DIR/${DOMAIN}_fullchain.pem"
-    if ! check_cert "$cert_file"; then
+    if ! check_cert_expiry "$cert_file" $RENEW_THRESHOLD; then
         status=$?
-        if [[ $status -eq 1 ]] || [[ $status -eq 2 ]]; then
+        if [[ $status -eq 2 ]]; then
             log "⚠️ Требуется обновление сертификата"
             renew_cert "$DOMAIN" && copy_certs "$DOMAIN" && reload_nginx || log "❌ Обновление завершено с ошибкой"
         fi
@@ -550,10 +604,7 @@ while true; do
     sleep $CHECK_INTERVAL
 done
 MONITOR_SCRIPT
-        
         chmod +x $ROOT_DIR/scripts/cert_monitor.sh
-        
-        # Добавляем программу в Supervisor
         cat <<EOF >> $SERVICE_FILE
 [program:cert-monitor]
 command=$ROOT_DIR/scripts/cert_monitor.sh
@@ -569,13 +620,11 @@ stderr_logfile_maxbytes=10MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
 EOF
-        
         echo -e "${GREEN}Мониторинг сертификата добавлен в Supervisor${RESET}"
     else
         echo -e "${YELLOW}ℹ️  Самоподписанный сертификат не нуждается в обновлении${RESET}"
     fi
 else
-    # Обновляем привязку Gunicorn на все интерфейсы (прямой доступ)
     update_service_ip "0.0.0.0" "$PORT"
     save_setup_var "HTTPS_ENABLED" "0"
 fi

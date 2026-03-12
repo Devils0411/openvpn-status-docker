@@ -35,6 +35,7 @@ from main import (
     read_wg_config,
 )
 
+
 # ============================================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ С РАЗДЕЛЕНИЕМ ПО УРОВНЯМ И РОТАЦИЕЙ ФАЙЛОВ
 # ============================================================================
@@ -319,7 +320,7 @@ def get_client_name_for_user(user_id: int):
         return profiles[0] if profiles else None
     return profiles
 
-def get_client_info_for_user(user_id: int):
+async def get_client_info_for_user(user_id: int):
     """Получает полную информацию о профилях пользователя с датами истечения."""
     profiles = get_client_mapping().get(str(user_id), [])
     if not profiles:
@@ -329,11 +330,10 @@ def get_client_info_for_user(user_id: int):
         profiles = [profiles]
     
     # Получаем список всех клиентов OpenVPN с датами
-    import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        clients = loop.run_until_complete(get_clients("openvpn"))
+        clients = await get_clients("openvpn")
     except:
+        logger.error(f"Ошибка получения клиентов: {e}")
         clients = []
     
     result = []
@@ -884,7 +884,7 @@ def create_notifications_menu(user_id: int):
 
 async def show_client_menu(message: types.Message, user_id: int):
     """Показывает меню клиента с информацией о сроке действия."""
-    client_info = get_client_info_for_user(user_id)
+    client_info = await get_client_info_for_user(user_id)
     
     if not client_info:
         await message.answer(
@@ -972,7 +972,7 @@ async def handle_user_profile_selection(callback: types.CallbackQuery, state: FS
     profile_name = callback.data.replace("user_select_profile_", "", 1)
     
     # Проверяем, что профиль действительно привязан к этому пользователю
-    client_info = get_client_info_for_user(callback.from_user.id)
+    client_info = await get_client_info_for_user(callback.from_user.id) 
     profile_info = None
     for info in client_info:
         if info.get("name") == profile_name:
@@ -1912,8 +1912,12 @@ async def handle_no_action(callback: types.CallbackQuery):
 async def handle_client_selection(callback: types.CallbackQuery, state: FSMContext):
     _, vpn_type, client_name = callback.data.split("_", 2)
     if callback.from_user.id not in ADMIN_ID:
-        allowed_client = get_client_name_for_user(callback.from_user.id)
-        if not allowed_client or allowed_client != client_name:
+        # Получаем ВСЕ профили пользователя
+        client_info = await get_client_info_for_user(callback.from_user.id)
+        
+        # Проверяем, есть ли запрошенный клиент среди профилей пользователя
+        allowed_clients = [info.get("name") for info in client_info if isinstance(info, dict)]
+        if not client_name or client_name not in allowed_clients:
             await callback.answer("Доступ запрещен!", show_alert=True)
             return
     
