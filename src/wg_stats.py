@@ -7,9 +7,9 @@ import time
 import sqlite3
 import subprocess
 import schedule
-from config import Config
 
-DB_PATH = Config.WG_STATS_PATH
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "databases" , "wireguard_stats.db")
 
 SAVE_TIME = "23:59"  # Время для фиксирования дневного трафика
 START_TIME = "00:00"  # Время для начала записи нового дня
@@ -255,7 +255,7 @@ def save_wg_stats():
 
     now = datetime.now().strftime("%H:%M:%S")
     # print(f"Сохранение статистики: {now}")
-    clean_old_daily_stats(days=7)
+    clean_old_daily_stats(days=365)
 
     # if not stats:
     #     print("❌ Нет данных для сохранения! Проверяем wg show...")
@@ -533,7 +533,7 @@ def main():
     today_date = datetime.now().strftime("%Y-%m-%d")
     if inter_date != today_date:
         save_daily_stats(True)
-        clean_old_daily_stats(days=7)
+        clean_old_daily_stats(days=365)
         time.sleep(3)
 
     while True:

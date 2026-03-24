@@ -27,10 +27,10 @@
                             <a href="{{ url_for('ovpn') }}"
                                 class="link-dark nav-link {{ 'active' if active_section == 'ovpn' else '' }}">OpenVPN</a>
                         </li>
-<!--                        <li class="nav-item">
+                        <li class="nav-item">
                             <a href="{{ url_for('wg') }}"
-                                class="link-dark nav-link {{ 'active' if active_page == 'wg' else '' }}">WireGuard</a>
-                        </li>-->
+                                class="link-dark nav-link {{ 'active' if active_section == 'wg' else '' }}">WireGuard</a>
+                        </li>
                         <li class="nav-item">
                             <a href="{{ url_for('settings') }}"
                                 class="link-dark nav-link {{ 'active' if active_page == 'settings' else '' }}">Настройки</a>
@@ -63,10 +63,10 @@
                         <a href="{{ url_for('ovpn') }}"
                             class="link-dark nav-link {{ 'active' if active_section == 'ovpn' else '' }}">OpenVPN</a>
                     </li>
-<!--                    <li class="nav-item">
+                    <li class="nav-item">
                         <a href="{{ url_for('wg') }}"
-                            class="link-dark nav-link {{ 'active' if active_page == 'wg' else '' }}">WireGuard</a>
-                    </li>-->
+                            class="link-dark nav-link {{ 'active' if active_section == 'wg' else '' }}">WireGuard</a>
+                    </li>
                     <li class="nav-item">
                         <a href="{{ url_for('settings') }}"
                             class="link-dark nav-link {{ 'active' if active_page == 'settings' else '' }}">Настройки</a>

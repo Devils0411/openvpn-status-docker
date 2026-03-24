@@ -219,10 +219,9 @@ async function updateSystemInfo() {
         const txElement = document.getElementById('tx_bytes');
         const vpnClientsElement = document.getElementById('vpn_clients');
         const openvpn = data.vpn_clients?.OpenVPN ?? 0;
-//        const wireguard = data.vpn_clients?.WireGuard ?? 0;
-        const vpnHtml = `<a class="text-decoration-none" href="${basePath}/ovpn">&#128279; <b>OpenVPN</b></a>: ${openvpn} шт.`;
-//        const vpnHtml = `<a class="text-decoration-none" href="${basePath}/ovpn">&#128279; <b>OpenVPN</b></a>: ${openvpn} шт.<br>
-//                     <a class="text-decoration-none" href="${basePath}/wg">&#128279; <b>WireGuard</b></a>: ${wireguard} шт.`;
+        const wireguard = data.vpn_clients?.WireGuard ?? 0;
+        const vpnHtml = `<a class="text-decoration-none" href="${basePath}/ovpn">&#128279; <b>OpenVPN</b></a>: ${openvpn} шт.<br>
+                     <a class="text-decoration-none" href="${basePath}/wg">&#128279; <b>WireGuard</b></a>: ${wireguard} шт.`;
 
         if (cpuElement.textContent !== data.cpu_load) cpuElement.textContent = data.cpu_load;
         if (memoryElement.textContent !== data.memory_used) memoryElement.textContent = data.memory_used;

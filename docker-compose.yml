@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    cap_add:
+      - SYS_ADMIN
     volumes:
       - /root/antizapret/config/openvpn/log:/etc/openvpn/server/logs:ro # Монтирование папки log-файлов OpenVPN
       - /root/openvpn-status/src/data:/root/web/src/data # Монтирование папки с базами данных
