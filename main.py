@@ -1606,9 +1606,10 @@ def get_vnstat_interfaces():
 @app.route("/logout", methods=["GET", "POST"])
 @login_required
 def logout():
+    username = current_user.username
     logout_user()
     session.pop("last_activity", None)
-    logger.info(f"👤 Пользователь {current_user.username} вышел из системы")
+    logger.info(f"👤 Пользователь {username} вышел из системы")
     return redirect(url_for("login"))
 
 
@@ -2278,17 +2279,177 @@ def ovpn_history():
         logger.error(f"❌ Ошибка на странице истории OpenVPN: {e}")
         return render_template("ovpn/ovpn_history.html", error_message=error_message), 500
 
+@app.route("/ovpn/stats")
+@login_required
+def ovpn_stats():
+    try:
+        sort_by = request.args.get("sort", "client_name")
+        order = request.args.get("order", "asc").lower()
+        period = request.args.get("period", "month")
+        target_date = request.args.get("date")
+        
+        # ✅ ОТЛАДКА: Логируем параметры
+        logger.debug(f"📊 Параметры запроса: period={period}, target_date={target_date}")
+        
+        # Разрешённые поля сортировки (ключ -> SQL)
+        allowed_sorts = {
+            "client_name": "client_name",
+            "total_bytes_sent": "SUM(total_bytes_sent)",
+            "total_bytes_received": "SUM(total_bytes_received)",
+            "last_connected": "MAX(last_connected)",
+        }
+        sort_column = allowed_sorts.get(sort_by, "client_name")
+        order_sql = "DESC" if order == "desc" else "ASC"
+
+        now = datetime.now()
+        date_from = None
+        date_to = None
+
+        # ✅ ЛОГИКА ФИЛЬТРАЦИИ ДАТ
+        if period == "day":
+            if target_date:
+                try:
+                    date_obj = datetime.strptime(target_date, "%Y-%m-%d")
+                    date_from = date_obj.strftime("%Y-%m-%d")
+                    date_to = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
+                except ValueError:
+                    date_from = now.strftime("%Y-%m-%d")
+                    date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                date_from = now.strftime("%Y-%m-%d")
+                date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+                
+        elif period == "month":
+            # ✅ Для месяца: от 1 числа до 1 числа следующего месяца
+            if target_date:
+                try:
+                    # Пробуем распарсить как YYYY-MM
+                    date_obj = datetime.strptime(target_date, "%Y-%m")
+                    date_from = date_obj.strftime("%Y-%m-01")
+                    # Первое число следующего месяца
+                    if date_obj.month == 12:
+                        date_to = f"{date_obj.year + 1}-01-01"
+                    else:
+                        date_to = f"{date_obj.year}-{date_obj.month + 1:02d}-01"
+                except ValueError:
+                    # Если не получилось, используем текущий месяц
+                    date_from = now.replace(day=1).strftime("%Y-%m-%d")
+                    if now.month == 12:
+                        date_to = f"{now.year + 1}-01-01"
+                    else:
+                        date_to = f"{now.year}-{now.month + 1:02d}-01"
+            else:
+                date_from = now.replace(day=1).strftime("%Y-%m-%d")
+                if now.month == 12:
+                    date_to = f"{now.year + 1}-01-01"
+                else:
+                    date_to = f"{now.year}-{now.month + 1:02d}-01"
+                    
+        elif period == "year":
+            if target_date:
+                try:
+                    year = int(target_date)
+                    date_from = f"{year}-01-01"
+                    date_to = f"{year + 1}-01-01"
+                except ValueError:
+                    date_from = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+                    date_to = (now.replace(year=now.year + 1, month=1, day=1)).strftime("%Y-%m-%d")
+            else:
+                date_from = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+                date_to = (now.replace(year=now.year + 1, month=1, day=1)).strftime("%Y-%m-%d")
+        else:
+            period = "month"
+            date_from = now.replace(day=1).strftime("%Y-%m-%d")
+            if now.month == 12:
+                date_to = f"{now.year + 1}-01-01"
+            else:
+                date_to = f"{now.year}-{now.month + 1:02d}-01"
+
+        # ✅ ОТЛАДКА: Логируем даты
+        logger.debug(f"📊 Диапазон дат: date_from={date_from}, date_to={date_to}")
+
+        stats_list = []
+        total_received, total_sent = 0, 0
+
+        with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
+            # ✅ Для периода "day" используем hourly_stats, для остальных monthly_stats
+            if period == "day":
+                query = f"""
+                    SELECT client_name,
+                           SUM(total_bytes_sent) as sent,
+                           SUM(total_bytes_received) as received,
+                           MAX(last_connected)
+                    FROM hourly_stats
+                    WHERE hour >= ? AND hour < ?
+                    GROUP BY client_name
+                    HAVING (SUM(total_bytes_sent) > 0 OR SUM(total_bytes_received) > 0)
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (date_from, date_to)).fetchall()
+            else:
+                # ✅ ИСПРАВЛЕНО: Используем strftime для сравнения по месяцу
+                query = f"""
+                    SELECT client_name,
+                           SUM(total_bytes_sent) as sent,
+                           SUM(total_bytes_received) as received,
+                           MAX(last_connected)
+                    FROM monthly_stats
+                    WHERE month >= ? AND month < ?
+                    GROUP BY client_name
+                    HAVING (SUM(total_bytes_sent) > 0 OR SUM(total_bytes_received) > 0)
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (date_from, date_to)).fetchall()
+            
+            # ✅ ОТЛАДКА: Логируем количество записей
+            logger.debug(f"📊 Найдено записей: {len(rows)}")
+
+            for client_name, sent, received, last_connected in rows:
+                total_received += received or 0
+                total_sent += sent or 0
+                stats_list.append(
+                    {
+                        "client_name": client_name,
+                        "total_bytes_sent": format_bytes(sent),
+                        "total_bytes_received": format_bytes(received),
+                        "last_connected": last_connected,
+                    }
+                )
+
+        logger.debug(f"📄 Запрошена статистика OpenVPN за {date_from} - {date_to} (активных клиентов: {len(stats_list)})")
+        return render_template(
+            "ovpn/ovpn_stats.html",
+            total_received=format_bytes(total_received),
+            total_sent=format_bytes(total_sent),
+            active_section="ovpn",
+            active_page="stats",
+            stats=stats_list,
+            period=period,
+            sort_by=sort_by,
+            order=order_sql.lower(),
+            target_date=target_date,
+        )
+
+    except Exception as e:
+        error_message = f"Произошла непредвиденная ошибка: {e}"
+        logger.error(f"❌ Ошибка на странице статистики OpenVPN: {e}")
+        return render_template("ovpn/ovpn_stats.html", error_message=error_message), 500
+
+
 @app.route("/api/ovpn/client_chart")
 @login_required
 def api_ovpn_client_chart():
     client_name = request.args.get("client")
     period = request.args.get("period", "month")
-    target_date = request.args.get("date")  # ✅ Новый параметр: конкретная дата
-    
+    target_date = request.args.get("date")
     if not client_name:
         return jsonify({"error": "client parameter required"}), 400
-    
+
     now = datetime.now()
+    date_from = None
+    date_to = None
+
+    # Логика дат для графика
     if period == "day":
         if target_date:
             try:
@@ -2301,10 +2462,9 @@ def api_ovpn_client_chart():
         else:
             date_from = now.strftime("%Y-%m-%d")
             date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-            
+
         try:
             with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-                # ✅ Запрос к hourly_stats
                 rows = conn.execute(
                     """SELECT hour,
                               SUM(total_bytes_received) as rx,
@@ -2317,20 +2477,19 @@ def api_ovpn_client_chart():
                        ORDER BY hour ASC""",
                     (client_name, date_from, date_to),
                 ).fetchall()
-                
+
                 labels = []
                 rx_data = []
                 tx_data = []
-                
+
                 for hour_val, rx, tx, conn_count, last_conn in rows:
-                    # ✅ Добавляем 'Z' для указания UTC, если нет часового пояса
                     if hour_val and 'T' in hour_val and not hour_val.endswith('Z'):
                         labels.append(hour_val + 'Z')
                     else:
                         labels.append(hour_val)
                     rx_data.append(rx or 0)
                     tx_data.append(tx or 0)
-                
+
                 logger.debug(f"📊 График OpenVPN клиента {client_name} (день: {date_from})")
                 return jsonify({
                     "client": client_name,
@@ -2347,44 +2506,161 @@ def api_ovpn_client_chart():
                 "tx_bytes": [],
             })
 
-    elif period == "week":
-        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
     elif period == "year":
-        date_from = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+        # ✅ ИСПРАВЛЕНО: Используем monthly_aggregated_stats для года, фильтруем по году
+        if target_date:
+            try:
+                year = int(target_date)
+                target_year_str = f"{year}"
+            except ValueError:
+                target_year_str = str(now.year)
+        else:
+            target_year_str = str(now.year)
+
+        try:
+            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
+                # ✅ ЗАПРОС К monthly_aggregated_stats: фильтр по году, группировка по месяцу
+                rows = conn.execute(
+                    """SELECT month, -- month будет в формате YYYY-MM
+                              SUM(total_bytes_received) as rx,
+                              SUM(total_bytes_sent) as tx
+                       FROM monthly_aggregated_stats
+                       WHERE client_name = ? AND SUBSTR(month, 1, 4) = ?
+                       GROUP BY month -- group by month (YYYY-MM)
+                       ORDER BY month ASC""",
+                    (client_name, target_year_str), # <-- Только 2 значения: client_name и target_year_str
+                ).fetchall()
+
+            labels = []
+            rx_data = []
+            tx_data = []
+
+            for month_val, rx, tx in rows:
+                # month_val уже в формате YYYY-MM, преобразуем в читаемый формат
+                try:
+                    dt = datetime.strptime(month_val, "%Y-%m")
+                    labels.append(dt.strftime("%b %Y")) # Например, "Mar 2026"
+                except:
+                    labels.append(month_val) # fallback
+                rx_data.append(rx or 0)
+                tx_data.append(tx or 0)
+
+            logger.debug(f"📊 График OpenVPN клиента {client_name} (год: {target_year_str})")
+            return jsonify({
+                "client": client_name,
+                "labels": labels,
+                "rx_bytes": rx_data,
+                "tx_bytes": tx_data,
+            })
+        except Exception as e:
+            logger.error(f"❌ Ошибка графика OpenVPN (year): {e}")
+            return jsonify({
+                "client": client_name,
+                "labels": [],
+                "rx_bytes": [],
+                "tx_bytes": [],
+            })
+
+    # elif period == "month": (оставляем без изменений, использует hourly_stats)
+    elif period == "month":
+        if target_date:
+            try:
+                date_obj = datetime.strptime(target_date, "%Y-%m")
+                date_from = date_obj.strftime("%Y-%m-01")
+                if date_obj.month == 12:
+                    date_to = f"{date_obj.year + 1}-01-01"
+                else:
+                    date_to = f"{date_obj.year}-{date_obj.month + 1:02d}-01"
+            except ValueError:
+                date_from = now.replace(day=1).strftime("%Y-%m-%d")
+                date_to = (now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
+        else:
+            date_from = now.replace(day=1).strftime("%Y-%m-%d")
+            date_to = (now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
+
+        try:
+            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
+                # Используем hourly_stats, группируем по дням
+                rows = conn.execute(
+                    """SELECT strftime('%Y-%m-%d', hour) as day_label,
+                              SUM(total_bytes_received) as rx,
+                              SUM(total_bytes_sent) as tx
+                       FROM hourly_stats
+                       WHERE client_name = ? AND hour >= ? AND hour < ?
+                       GROUP BY day_label
+                       ORDER BY day_label ASC""",
+                    (client_name, date_from, date_to),
+                ).fetchall()
+
+            labels = []
+            rx_data = []
+            tx_data = []
+            for day_label, rx, tx in rows:
+                try:
+                    day_obj = datetime.strptime(day_label, "%Y-%m-%d")
+                    labels.append(day_obj.strftime("%d.%m"))
+                except:
+                    labels.append(day_label)
+                rx_data.append(rx or 0)
+                tx_data.append(tx or 0)
+
+            logger.debug(f"📊 График OpenVPN клиента {client_name} (месяц: {date_from})")
+            return jsonify({
+                "client": client_name,
+                "labels": labels,
+                "rx_bytes": rx_data,
+                "tx_bytes": tx_data,
+            })
+        except Exception as e:
+            logger.error(f"❌ Ошибка графика OpenVPN (month): {e}")
+            return jsonify({
+                "client": client_name,
+                "labels": [],
+                "rx_bytes": [],
+                "tx_bytes": [],
+            })
+
     else:
-        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
-    
-    try:
-        with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-            rows = conn.execute(
-                """SELECT month,
-                          SUM(total_bytes_received) as rx,
-                          SUM(total_bytes_sent) as tx
-                   FROM monthly_stats
-                   WHERE client_name = ? AND month >= ?
-                   GROUP BY month
-                   ORDER BY month ASC""",
-                (client_name, date_from),
-            ).fetchall()
-        
-        labels = []
-        rx_data = []
-        tx_data = []
-        for month_val, rx, tx in rows:
-            labels.append(month_val)
-            rx_data.append(rx or 0)
-            tx_data.append(tx or 0)
-        
-        logger.debug(f"📊 График OpenVPN клиента {client_name}")
-        return jsonify({
-            "client": client_name,
-            "labels": labels,
-            "rx_bytes": rx_data,
-            "tx_bytes": tx_data,
-        })
-    except Exception as e:
-        logger.error(f"❌ Ошибка графика OpenVPN: {e}")
-        return jsonify({"error": str(e)}), 500
+        # Fallback для неизвестного периода, используем текущий месяц
+        date_from = now.replace(day=1).strftime("%Y-%m-%d")
+        date_to = (now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
+
+        try:
+            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
+                rows = conn.execute(
+                    """SELECT strftime('%Y-%m-%d', hour) as day_label,
+                              SUM(total_bytes_received) as rx,
+                              SUM(total_bytes_sent) as tx
+                       FROM hourly_stats
+                       WHERE client_name = ? AND hour >= ? AND hour < ?
+                       GROUP BY day_label
+                       ORDER BY day_label ASC""",
+                    (client_name, date_from, date_to),
+                ).fetchall()
+
+            labels = []
+            rx_data = []
+            tx_data = []
+            for day_label, rx, tx in rows:
+                try:
+                    day_obj = datetime.strptime(day_label, "%Y-%m-%d")
+                    labels.append(day_obj.strftime("%d.%m"))
+                except:
+                    labels.append(day_label)
+                rx_data.append(rx or 0)
+                tx_data.append(tx or 0)
+
+            logger.debug(f"📊 График OpenVPN клиента {client_name}")
+            return jsonify({
+                "client": client_name,
+                "labels": labels,
+                "rx_bytes": rx_data,
+                "tx_bytes": tx_data,
+            })
+        except Exception as e:
+            logger.error(f"❌ Ошибка графика OpenVPN: {e}")
+            return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/wg/client_chart")
 @login_required
@@ -2398,12 +2674,12 @@ def api_wg_client_chart():
     now = datetime.now()
     if period == "day":
         date_from = now.strftime("%Y-%m-%d")
-    elif period == "week":
-        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    elif period == "month":
+        date_from = now.replace(day=1).strftime("%Y-%m-%d")
     elif period == "year":
-        date_from = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+        date_from = now.replace(month=1, day=1).strftime("%Y-%m-%d")
     else:
-        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        date_from = now.replace(day=1).strftime("%Y-%m-%d")
     
     try:
         with sqlite3.connect(app.config["WG_STATS_PATH"]) as conn:
@@ -2438,82 +2714,6 @@ def api_wg_client_chart():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/ovpn/stats")
-@login_required
-def ovpn_stats():
-    try:
-        sort_by = request.args.get("sort", "client_name")
-        order = request.args.get("order", "asc").lower()
-        period = request.args.get("period", "month")
-        # Разрешённые поля сортировки (ключ -> SQL)
-        allowed_sorts = {
-            "client_name": "client_name",
-            "total_bytes_sent": "SUM(total_bytes_received)",
-            "total_bytes_received": "SUM(total_bytes_sent)",
-            "last_connected": "MAX(last_connected)",
-        }
-
-        sort_column = allowed_sorts.get(sort_by, "client_name")
-        order_sql = "DESC" if order == "desc" else "ASC"
-
-        now = datetime.now()
-        if period == "day":
-            date_from = now.strftime("%Y-%m-%d")
-        elif period == "week":
-            date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        elif period == "year":
-            date_from = (now - timedelta(days=365)).strftime("%Y-%m-%d")
-        else:
-            period = "month"
-            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
-
-        stats_list = []
-        total_received, total_sent = 0, 0
-
-        with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-            query = f"""
-                SELECT client_name,
-                       SUM(total_bytes_sent),
-                       SUM(total_bytes_received),
-                       MAX(last_connected)
-                FROM monthly_stats
-                WHERE month >= ?
-                GROUP BY client_name
-                ORDER BY {sort_column} {order_sql}
-            """
-            rows = conn.execute(query, (date_from,)).fetchall()
-
-            for client_name, sent, received, last_connected in rows:
-                total_received += received or 0
-                total_sent += sent or 0
-                stats_list.append(
-                    {
-                        "client_name": client_name,
-                        "total_bytes_sent": format_bytes(sent),
-                        "total_bytes_received": format_bytes(received),
-                        "last_connected": last_connected,
-                    }
-                )
-
-        logger.debug(f"📄 Запрошена статистика OpenVPN за {date_from}")
-        return render_template(
-            "ovpn/ovpn_stats.html",
-            total_received=format_bytes(total_received),
-            total_sent=format_bytes(total_sent),
-            active_section="ovpn",
-            active_page="stats",
-            stats=stats_list,
-            period=period,
-            sort_by=sort_by,
-            order=order_sql.lower(),
-        )
-
-    except Exception as e:
-        error_message = f"Произошла непредвиденная ошибка: {e}"
-        logger.error(f"❌ Ошибка на странице статистики OpenVPN: {e}")
-        return render_template("ovpn/ovpn_stats.html", error_message=error_message), 500
-
-
 @app.route("/api/bw")
 @login_required
 def api_bw():
@@ -2546,16 +2746,12 @@ def api_bw():
         points = 12
         interval_seconds = 300
     elif period == "day":
-        vnstat_option = "h"  # по часам
+        vnstat_option = "h"
         points = 24
         interval_seconds = 3600
-    elif period == "week":
-        vnstat_option = "d"
-        points = 7
-        interval_seconds = 86400
     elif period == "month":
         vnstat_option = "d"
-        points = 30
+        points = now.day
         interval_seconds = 86400
     else:
         vnstat_option = "h"
@@ -2671,11 +2867,10 @@ def api_cpu():
 
     # Количество точек для каждого фильтра
     targets = {
-        "live": LIVE_POINTS,  # 60 точек
-        "hour": 60,  # 60 минут
-        "day": 24,  # 24 часа
-        "week": 7,  # 7 дней
-        "month": 30,  # 30 дней
+        "live": LIVE_POINTS,
+        "hour": 60,
+        "day": 24,
+        "month": now.day,
     }
     max_points = targets.get(period, LIVE_POINTS)
 
@@ -2700,12 +2895,9 @@ def api_cpu():
         elif period == "day":
             bucket = "hour"
             cutoff = now - timedelta(days=1)
-        elif period == "week":
-            bucket = "day"
-            cutoff = now - timedelta(days=7)
         elif period == "month":
             bucket = "day"
-            cutoff = now - timedelta(days=30)
+            cutoff = now.replace(day=1)
         else:
             bucket = "minute"
             cutoff = now - timedelta(hours=1)

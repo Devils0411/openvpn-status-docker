@@ -1,8 +1,9 @@
 let clientChart = null;
 let selectedClient = null;
-let selectedChartPeriod = 'day';
+let selectedChartPeriod = 'month';
 let selectedChartDate = null;
 const OVPN_DATE_KEY = 'ovpnStats.selectedDate';
+const OVPN_PERIOD_KEY = 'ovpnStats.selectedPeriod';
 const OVPN_CHART_VISIBLE_KEY = 'ovpnStats.chartVisible';
 
 function getThemeColors() {
@@ -39,27 +40,64 @@ function formatLabel(dateStr, period) {
         console.warn('Invalid date label:', dateStr);
         return dateStr;
     }
-    if (period === 'day' || period === 'hour') {
-        return d.toLocaleTimeString('ru-RU', { 
-            hour: '2-digit', 
+    if (period === 'day') {
+        return d.toLocaleTimeString('ru-RU', {
+            hour: '2-digit',
             minute: '2-digit',
-            hour12: false 
+            hour12: false
         });
+    } else if (period === 'year') {
+        // ✅ Для года показываем месяц
+        return d.toLocaleDateString('ru-RU', {
+            month: 'short',
+            year: 'numeric'
+        }).replace(/\./g, '');
     }
-    return d.toLocaleDateString('ru-RU', { 
-        day: '2-digit', 
+    
+    return d.toLocaleDateString('ru-RU', {
+        day: '2-digit',
         month: '2-digit',
         year: 'numeric'
     });
 }
 
+// ✅ Генерация опций для выбора месяца
+function generateMonthOptions() {
+    const monthNames = [
+        'январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+        'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'
+    ];
+    const select = document.getElementById('chartMonth');
+    if (!select) return;
+
+    // Очищаем существующие опции
+    select.innerHTML = '';
+
+    const now = new Date();
+    const currentYear = now.getFullYear();
+
+    // Генерируем месяцы за последние 12 месяцев + текущий
+    for (let i = 5; i >= 0; i--) {
+        const date = new Date(currentYear, now.getMonth() - i, 1);
+        const year = date.getFullYear();
+        const month = date.getMonth();
+        const value = `${year}-${String(month + 1).padStart(2, '0')}`;
+        const label = `${monthNames[month]} ${year} г.`;
+        
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        select.appendChild(option);
+    }
+}
+
 async function updateClientChart() {
     if (!selectedClient) return;
-    
     const basePath = window.basePath || '';
     let url = `${basePath}/api/ovpn/client_chart?client=${encodeURIComponent(selectedClient)}&period=${selectedChartPeriod}`;
-
-    if ((selectedChartPeriod === 'day' || selectedChartPeriod === 'hour') && selectedChartDate) {
+    
+    // ✅ Добавляем дату для day и month
+    if ((selectedChartPeriod === 'day' || selectedChartPeriod === 'month') && selectedChartDate) {
         url += `&date=${selectedChartDate}`;
     }
 
@@ -74,12 +112,37 @@ async function updateClientChart() {
         const rawLabels = (data.labels && data.labels.length) ? data.labels : [];
         const labels = rawLabels.map(lab => formatLabel(lab, selectedChartPeriod));
 
+        const dateDisplay = document.getElementById('chartDateDisplay');
+        if (dateDisplay) {
+            if (selectedChartPeriod === 'day' && selectedChartDate) {
+                const dateObj = new Date(selectedChartDate);
+                dateDisplay.textContent = dateObj.toLocaleDateString('ru-RU', {
+                    day: '2-digit',
+                    month: '2-digit',
+                    year: 'numeric'
+                });
+            } else if (selectedChartPeriod === 'month' && selectedChartDate) {
+                // ✅ Отображаем выбранный месяц, а не текущий
+                const [year, month] = selectedChartDate.split('-');
+                const monthNames = [
+                    'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+                    'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
+                ];
+                dateDisplay.textContent = `${monthNames[parseInt(month) - 1]} ${year} г.`;
+            } else if (selectedChartPeriod === 'year') {
+                const now = new Date();
+                dateDisplay.textContent = now.getFullYear().toString();
+            } else {
+                dateDisplay.textContent = '';
+            }
+        }
+
         const colors = getThemeColors();
-        const xAxisTitle = (selectedChartPeriod === 'day' || selectedChartPeriod === 'hour') ? 'Время' : 'Дата';
+        const xAxisTitle = (selectedChartPeriod === 'day') ? 'Время' : 'Дата';
 
         const datasets = [
             {
-                label: 'Получено',
+                label: 'Передано',
                 data: data.rx_bytes,
                 fill: true,
                 borderColor: colors.rx.border,
@@ -88,7 +151,7 @@ async function updateClientChart() {
                 pointRadius: selectedChartPeriod === 'day' ? 1 : 2
             },
             {
-                label: 'Передано',
+                label: 'Получено',
                 data: data.tx_bytes,
                 fill: true,
                 borderColor: colors.tx.border,
@@ -134,10 +197,13 @@ async function updateClientChart() {
                         x: {
                             title: { display: true, text: xAxisTitle, color: colors.text },
                             grid: { color: colors.grid },
-                            ticks: { 
-                                color: colors.text,
-                                maxTicksLimit: selectedChartPeriod === 'day' ? 24 : undefined
-                            }
+    			    ticks: {
+        		        color: colors.text,
+       				maxTicksLimit: selectedChartPeriod === 'year' ? 12 : (selectedChartPeriod === 'day' ? 24 : undefined),
+        			autoSkip: true,
+        			maxRotation: 45,
+        			minRotation: 0
+    			   }
                         }
                     },
                     plugins: {
@@ -165,8 +231,6 @@ function selectClient(clientName) {
     const container = document.getElementById('clientChartContainer');
     const nameEl = document.getElementById('chartClientName');
     if (!container || !nameEl) return;
-
-    // Если график скрыт, показываем его при выборе клиента
     if (container.style.display === 'none') {
         toggleClientChartVisibility(true);
     }
@@ -205,11 +269,9 @@ function toggleClientChartVisibility(forceShow = null) {
     const chartContainer = document.getElementById('clientChartContainer');
     const toggleBtn = document.getElementById('toggleClientChartBtn');
     if (!chartContainer || !toggleBtn) return;
-    
     const icon = toggleBtn.querySelector('i');
     const isVisible = chartContainer.style.display !== 'none';
     const shouldShow = forceShow !== null ? forceShow : !isVisible;
-    
     if (shouldShow) {
         chartContainer.style.display = 'block';
         toggleBtn.classList.add('active', 'btn-primary');
@@ -220,7 +282,7 @@ function toggleClientChartVisibility(forceShow = null) {
             icon.classList.add('bi-graph-down');
         }
         localStorage.setItem(OVPN_CHART_VISIBLE_KEY, 'true');
-        
+
         setTimeout(() => {
             if (clientChart) {
                 clientChart.resize();
@@ -238,7 +300,7 @@ function toggleClientChartVisibility(forceShow = null) {
             icon.classList.add('bi-graph-up');
         }
         localStorage.setItem(OVPN_CHART_VISIBLE_KEY, 'false');
-        
+
         if (clientChart) {
             clientChart.destroy();
             clientChart = null;
@@ -246,21 +308,111 @@ function toggleClientChartVisibility(forceShow = null) {
     }
 }
 
+// ✅ Обновление видимости селекторов даты/месяца
 function updateDatePickerVisibility() {
     const datePickerContainer = document.getElementById('datePickerContainer');
+    const dateInput = document.getElementById('chartDate');
+    const monthSelect = document.getElementById('chartMonth');
+    const dateLabel = document.getElementById('dateLabel');
+    const monthLabel = document.getElementById('monthLabel');
+    
     if (datePickerContainer) {
-        datePickerContainer.style.display = (selectedChartPeriod === 'day' || selectedChartPeriod === 'hour') ? 'block' : 'none';
+        datePickerContainer.style.display = (selectedChartPeriod === 'day' || selectedChartPeriod === 'month') ? 'block' : 'none';
+    }
+
+    if (dateInput && monthSelect && dateLabel && monthLabel) {
+        if (selectedChartPeriod === 'day') {
+            dateInput.style.display = 'inline-block';
+            dateLabel.style.display = 'inline';
+            monthSelect.style.display = 'none';
+            monthLabel.style.display = 'none';
+        } else if (selectedChartPeriod === 'month') {
+            dateInput.style.display = 'none';
+            dateLabel.style.display = 'none';
+            monthSelect.style.display = 'inline-block';
+            monthLabel.style.display = 'inline';
+            // ✅ Генерируем опции только один раз при показе
+            if (monthSelect.options.length === 0) {
+                generateMonthOptions();
+            }
+        } else {
+            dateInput.style.display = 'none';
+            monthSelect.style.display = 'none';
+            dateLabel.style.display = 'none';
+            monthLabel.style.display = 'none';
+        }
     }
 }
 
+// ✅ Установка даты/месяца по умолчанию (только если нет сохранённого значения)
 function setDefaultDate() {
     const dateInput = document.getElementById('chartDate');
-    if (dateInput && !selectedChartDate) {
-        const today = new Date().toISOString().split('T')[0];
-        dateInput.value = today;
-        selectedChartDate = today;
-        try { localStorage.setItem(OVPN_DATE_KEY, today); } catch (e) {}
+    const monthSelect = document.getElementById('chartMonth');
+    const today = new Date();
+    
+    // ✅ НЕ переопределяем, если дата уже восстановлена из localStorage
+    if (selectedChartPeriod === 'day') {
+        if (dateInput && !selectedChartDate) {
+            const todayStr = today.toISOString().split('T')[0];
+            dateInput.value = todayStr;
+            selectedChartDate = todayStr;
+        }
+    } else if (selectedChartPeriod === 'month') {
+        if (monthSelect && !selectedChartDate) {
+            const monthStr = today.toISOString().slice(0, 7); // YYYY-MM
+            if (monthSelect.options.length === 0) {
+                generateMonthOptions();
+            }
+            monthSelect.value = monthStr;
+            selectedChartDate = monthStr;
+        }
     }
+}
+
+// ✅ Обновление статистики при изменении даты/месяца
+function updateStatsOnDateChange() {
+    const dateInput = document.getElementById('chartDate');
+    const monthSelect = document.getElementById('chartMonth');
+    let newDate = null;
+    
+    if (selectedChartPeriod === 'day' && dateInput) {
+        newDate = dateInput.value;
+    } else if (selectedChartPeriod === 'month' && monthSelect) {
+        newDate = monthSelect.value;
+    }
+    
+    if (!newDate || newDate === selectedChartDate) return;
+    
+    selectedChartDate = newDate;
+    
+    // ✅ Сохраняем дату И период в localStorage
+    try { 
+        localStorage.setItem(OVPN_DATE_KEY, newDate);
+        localStorage.setItem(OVPN_PERIOD_KEY, selectedChartPeriod);
+    } catch (e) {}
+    
+    // ✅ Обновляем график клиента (если выбран)
+    if (selectedClient) {
+        updateClientChart();
+    }
+    
+    // ✅ Обновляем страницу статистики (перезагрузка с новой датой)
+    const url = new URL(window.location.href);
+    url.searchParams.set('date', newDate);
+    url.searchParams.set('period', selectedChartPeriod);
+    window.history.pushState({}, '', url);
+    
+    // Показываем индикатор загрузки
+    const tableContainer = document.querySelector('.client-table');
+    if (tableContainer) {
+        tableContainer.style.opacity = '0.5';
+        tableContainer.style.pointerEvents = 'none';
+    }
+    
+    // Перезагружаем страницу для обновления таблицы
+    setTimeout(() => {
+        window.location.reload();
+    }, 300);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -296,37 +448,58 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         });
     }
-
+    
     // Клик по строке таблицы
     document.querySelectorAll('.client-table tbody tr[data-client]').forEach(row => {
         row.addEventListener('click', () => {
             selectClient(row.dataset.client);
         });
     });
-
-    // Инициализация периода
-    const activePeriodBtn = document.querySelector('.chart-period.active');
-    if (activePeriodBtn && activePeriodBtn.dataset.period) {
-        selectedChartPeriod = activePeriodBtn.dataset.period;
+    
+    // ✅ 1. Сначала восстанавливаем период из URL или localStorage
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlPeriod = urlParams.get('period');
+    
+    if (urlPeriod && ['day', 'month', 'year'].includes(urlPeriod)) {
+        selectedChartPeriod = urlPeriod;
+    } else {
+        try {
+            const savedPeriod = localStorage.getItem(OVPN_PERIOD_KEY);
+            if (savedPeriod && ['day', 'month', 'year'].includes(savedPeriod)) {
+                selectedChartPeriod = savedPeriod;
+            }
+        } catch (e) {}
+        
+        if (!selectedChartPeriod) {
+            const activePeriodBtn = document.querySelector('.chart-period.active');
+            if (activePeriodBtn && activePeriodBtn.dataset.period) {
+                selectedChartPeriod = activePeriodBtn.dataset.period;
+            } else {
+                selectedChartPeriod = 'month';
+            }
+        }
     }
-
-    // Обработчики кнопок периода
+    
+    // ✅ 2. Обработчики кнопок периода
     document.querySelectorAll('.chart-period').forEach(btn => {
         btn.addEventListener('click', function (e) {
-            selectedChartPeriod = this.dataset.period || selectedChartPeriod;
+            const period = this.dataset.period;
+            if (period) {
+                selectedChartPeriod = period;
+                try { localStorage.setItem(OVPN_PERIOD_KEY, period); } catch (e) {}
+            }
             updateDatePickerVisibility();
-            if (selectedChartPeriod === 'day' || selectedChartPeriod === 'hour') {
+            if (selectedChartPeriod === 'day' || selectedChartPeriod === 'month') {
                 setDefaultDate();
             }
         });
     });
-
-    // ✅ Обработчик кнопки переключения видимости графика
+    
+    // Обработчик кнопки переключения видимости графика
     const toggleBtn = document.getElementById('toggleClientChartBtn');
     if (toggleBtn) {
         toggleBtn.addEventListener('click', () => toggleClientChartVisibility());
         
-        // ✅ График скрыт по умолчанию при загрузке страницы
         const chartContainer = document.getElementById('clientChartContainer');
         if (chartContainer) {
             chartContainer.style.display = 'none';
@@ -340,27 +513,54 @@ document.addEventListener('DOMContentLoaded', () => {
             icon.classList.add('bi-graph-up');
         }
     }
-
-    // ✅ Убрано восстановление последнего клиента (чтобы график не открывался сам)
-    // Восстанавливаем только выбранную дату
+    
+    // ✅ 3. Восстанавливаем сохранённую дату ИЗ localStorage (ПОСЛЕ периода)
     try {
         const savedDate = localStorage.getItem(OVPN_DATE_KEY);
-        if (savedDate) {
+        const savedPeriod = localStorage.getItem(OVPN_PERIOD_KEY);
+        
+        // ✅ Используем сохранённый период, если он есть
+        if (savedPeriod && ['day', 'month', 'year'].includes(savedPeriod)) {
+            selectedChartPeriod = savedPeriod;
+        }
+        
+        if (savedDate && (selectedChartPeriod === 'day' || selectedChartPeriod === 'month')) {
             selectedChartDate = savedDate;
-            const dateInput = document.getElementById('chartDate');
-            if (dateInput) {
-                dateInput.value = savedDate;
-            }
         }
     } catch (e) {
         console.warn('Не удалось восстановить дату:', e);
     }
-
-
-    // Инициализация
+    
+    // ✅ 4. Вызываем updateDatePickerVisibility ПЕРЕД установкой значений
     updateDatePickerVisibility();
-    setDefaultDate();
-
+    
+    // ✅ 5. Теперь устанавливаем значения в input/select
+    if (selectedChartDate) {
+        const dateInput = document.getElementById('chartDate');
+        const monthSelect = document.getElementById('chartMonth');
+        
+        if (selectedChartPeriod === 'day' && dateInput) {
+            dateInput.value = selectedChartDate;
+        } else if (selectedChartPeriod === 'month' && monthSelect) {
+            if (monthSelect.options.length === 0) {
+                generateMonthOptions();
+            }
+            monthSelect.value = selectedChartDate;
+        }
+    }
+    
+    // Обработчик изменения даты
+    const dateInput = document.getElementById('chartDate');
+    if (dateInput) {
+        dateInput.addEventListener('change', updateStatsOnDateChange);
+    }
+    
+    // Обработчик изменения месяца
+    const monthSelect = document.getElementById('chartMonth');
+    if (monthSelect) {
+        monthSelect.addEventListener('change', updateStatsOnDateChange);
+    }
+    
     // Смена темы
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
         if (clientChart) {
