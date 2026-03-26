@@ -1686,14 +1686,13 @@ def get_git_version():
 def get_docker_hub_version():
     """
     Получает последний семантический тег из Docker Hub.
-    Результат кэшируется на cache_ttl_minutes минут через lru_cache.
-    Для сброса кэша: get_docker_hub_version.cache_clear()
+    Возвращает актуальную версию, отсортированную по семантическому версионированию.
     """
     try:
-        # Запрашиваем теги с сортировкой по дате (последние сначала)
+        # Запрашиваем теги с Docker Hub API
         response = requests.get(
             DOCKER_HUB_API,
-            params={"page_size": 100, "ordering": "-last_updated"},
+            params={"page_size": 100},
             timeout=10
         )
         response.raise_for_status()
@@ -1702,12 +1701,28 @@ def get_docker_hub_version():
         
         # Фильтруем теги: оставляем только семантические версии (vX.Y.Z или X.Y.Z)
         import re
-        semver_pattern = re.compile(r'^v?\d+\.\d+\.\d+$')
-        version_tags = [t for t in tags if semver_pattern.match(t)]
+        semver_pattern = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)$')
+        version_tags = []
+        
+        for tag in tags:
+            match = semver_pattern.match(tag)
+            if match:
+                # Сохраняем тег и его числовые компоненты для сортировки
+                version_tags.append({
+                    'tag': tag,
+                    'major': int(match.group(1)),
+                    'minor': int(match.group(2)),
+                    'patch': int(match.group(3))
+                })
         
         if version_tags:
-            # Возвращаем первый (самый новый) тег
-            version = version_tags[0]
+            # Сортируем версии по major.minor.patch (от новой к старой)
+            version_tags.sort(
+                key=lambda v: (v['major'], v['minor'], v['patch']),
+                reverse=True
+            )
+            # Возвращаем самую новую версию
+            version = version_tags[0]['tag']
             logger.debug(f"📦 Docker Hub версия: {version}")
             return version
         
