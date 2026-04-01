@@ -275,6 +275,10 @@ def read_settings():
     merged = DEFAULT_SETTINGS.copy()
     merged.update(data)
 
+    if not os.path.exists(SETTINGS_PATH):
+        write_settings_data(merged)
+        logger.info(f"✅ Файл настроек создан: {SETTINGS_PATH}")
+
     telegram_admins = merged.get("telegram_admins")
     if not isinstance(telegram_admins, dict):
         telegram_admins = {}
@@ -1246,7 +1250,7 @@ def read_csv(file_path, config_protocol):
                 data.append(
                     [
                         client_name,
-                        mask_ip(real_address),
+                        real_address,
                         row[3],
                         format_bytes(received),
                         format_bytes(sent),
@@ -2403,6 +2407,7 @@ def ovpn():
             clients.sort(key=lambda x: x[9], reverse=reverse_order)
 
         total_clients = len(clients)
+        hide_ovpn_ip = read_settings().get("hide_ovpn_ip", True)
         logger.debug(f"📄 Запрошена страница OpenVPN ({total_clients} клиентов)")
         return render_template(
             "ovpn/ovpn.html",
@@ -2415,6 +2420,7 @@ def ovpn():
             errors=errors,
             sort_by=sort_by,
             order=order,
+            hide_ip=hide_ovpn_ip,
         )
 
     except ZoneInfoNotFoundError:
