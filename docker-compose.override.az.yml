@@ -1,0 +1,40 @@
+services:
+  openvpn-status:
+    hostname: openvpn-status.antizapret
+    networks:
+      - antizapret_default
+    extends:
+      file: docker-compose.yml
+      service: openvpn-status
+    environment:
+      - PORT=2000
+      - ADMIN_USERNAME=admin!
+      - ADMIN_PASSWORD=admin!
+      - BOT_ON=N
+      - BOT_TOKEN=1
+      - ADMIN_ID=1
+      - HTTPS_ON=N #При интеграции в Antizapret - https должен быть отключен
+#      - DOMAIN_NAME=Test.ru #Указываем имя домена, если оно существует. (при условии включения HTTPS)
+
+# Необходимо пересоздать контейнер dashboard с нижеуказанными настройками
+#  dashboard:
+#    extends:
+#      file: services/dashboard/docker-compose.yml
+#      service: dashboard
+#    environment:
+#      - DASHBOARD_SERVICE_6=OpenVPN Status:6443:openvpn-status.antizapret:2000
+#
+# Если запущен контейнер https в Antizapret, его также нужно пересоздать с нижеуказанными настройками
+#  https:
+#    extends:
+#      file: services/https/docker-compose.yml
+#      service: https
+#    ports:
+#      - "6443:6443"
+#    environment:
+#      - PROXY_SERVICE_7=OpenVPN Status:6443:openvpn-status.antizapret:2000
+
+networks:
+  antizapret_default:
+    external: true
+    name: antizapret_default

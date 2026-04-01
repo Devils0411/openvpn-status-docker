@@ -1,0 +1,20 @@
+services:
+  openvpn-status:
+    image: devils0411/openvpn-status:latest
+    container_name: openvpn-status
+    build:
+      context: .
+      dockerfile: Dockerfile
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - /root/antizapret/config/openvpn/log:/etc/openvpn/server/logs:ro # Монтирование папки log-файлов OpenVPN
+      - /root/openvpn-status/src/data:/root/web/src/data # Монтирование папки с базами данных
+      - /root/antizapret/config/openvpn:/root/web/openvpn #Монтирование папки OpenVPN
+      - /root/antizapret/config/wireguard_amnezia:/root/web/awg #Монтирование папки Amnesia Wireguard
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PORT=1235
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin
+    restart: unless-stopped
