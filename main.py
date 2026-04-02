@@ -154,10 +154,12 @@ last_collect = 0
 #Переменные для OpenVPN
 ovpn_live_stats = defaultdict(lambda: {"rx_speed": [], "tx_speed": [], "timestamps": []})
 MAX_OVPN_LIVE_POINTS = 60 * 12  # хранить 12 часов с шагом 1 минута
+OVPN_DB_SAVE_INTERVAL = 300  # запись в БД каждые 5 минут
+ovpn_last_db_save = 0
 ovpn_stats_lock = Lock()
 ovpn_last_bytes = {}  # Для расчёта дельты
-ovpn_last_db_save = 0
-OVPN_DB_SAVE_INTERVAL = 30  # запись в БД каждые 30 секунд
+
+
 
 BOT_RESTART_LOCK = Lock()
 BOT_SERVICE_NAME = "telegram-bot"
@@ -764,8 +766,7 @@ def read_wg_config(file_path):
 def get_disabled_wg_peers():
     """Получает отключённых пиров из конфигурационных файлов WireGuard."""
     configs = {
-        "vpn": "/etc/wireguard/vpn.conf",
-        "antizapret": "/etc/wireguard/antizapret.conf",
+        "antizapret": "/root/web/awg/wg0.conf",
     }
     result = {}
     for interface, config_path in configs.items():
@@ -1617,7 +1618,7 @@ def ovpn_db_save_loop():
             save_ovpn_stats_to_db()
             ovpn_last_db_save = now
 
-        time.sleep(1)
+        time.sleep(5)
 
 # -----------------------------------------------
 
