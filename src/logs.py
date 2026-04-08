@@ -67,8 +67,6 @@ logger.addHandler(stderr_handler)
 # =============================================================================
 DB_PATH = Config.LOGS_DATABASE_PATH
 LOG_FILES = Config.LOG_FILES
-RETENTION_MONTHS = 180
-RETENTION_YEARS = 365
 HOURLY_RETENTION_DAYS = 60
 CONNECTION_RETENTION_DAYS = 3
 
@@ -117,26 +115,7 @@ def initialize_database():
                 ON monthly_stats(client_name, month)
             """)
 
-            # 3. Таблица years_stats (месячная статистика)
-            # Уникальность: клиент + месяц (YYYY-MM)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS years_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    client_name TEXT,
-                    month TEXT,
-                    total_bytes_received INTEGER DEFAULT 0,
-                    total_bytes_sent INTEGER DEFAULT 0,
-                    total_connections INTEGER DEFAULT 0,
-                    last_connected TEXT,
-                    UNIQUE(client_name, month)
-                )
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_agg_client_month
-                ON years_stats(client_name, month)
-            """)
-
-            # 4. Таблица last_client_stats (для расчета дельты трафика)
+            # 3. Таблица last_client_stats (для расчета дельты трафика)
             # Ключ только по client_name
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS last_client_stats (
@@ -146,7 +125,7 @@ def initialize_database():
                     bytes_sent INTEGER
                 )
             """)
-            # 5. Таблица connection_logs (ИСТОРИЯ ПОДКЛЮЧЕНИЙ - для /ovpn/history)
+            # 4. Таблица connection_logs (ИСТОРИЯ ПОДКЛЮЧЕНИЙ - для /ovpn/history)
             # Здесь СОХРАНЯЕМ ip_address и protocol для отображения в истории
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS connection_logs (
@@ -201,12 +180,8 @@ def cleanup_old_data():
             cursor.execute("DELETE FROM daily_stats WHERE hour < ?", (cutoff_hourly,))
             
             # Очистка monthly_stats
-            cutoff_months = (datetime.now() - timedelta(days=RETENTION_MONTHS)).strftime("%Y-%m-%d")
-            cursor.execute("DELETE FROM monthly_stats WHERE month < ?", (cutoff_months,))            
-
-            # Очистка years_stats
-            cutoff_years = (datetime.now() - timedelta(days=RETENTION_YEARS)).strftime("%Y-%m")
-            cursor.execute("DELETE FROM years_stats WHERE month < ?", (cutoff_years,))
+#            cutoff_months = (datetime.now() - timedelta(days=RETENTION_MONTHS)).strftime("%Y-%m-%d")
+#            cursor.execute("DELETE FROM monthly_stats WHERE month < ?", (cutoff_months,))            
             
             conn.commit()
             logger.info("🧹 Старые данные очищены.")
@@ -436,40 +411,6 @@ def aggregate_daily_to_monthly():
         logging.error(f"❌ Ошибка при агрегации daily->monthly: {e}")
         raise
 
-def aggregate_monthly_to_yearly():
-    """
-    Агрегирует данные из monthly_stats в years_stats.
-    Группировка: Клиент + Месяц (YYYY-MM).
-    """
-    logging.info("🔄 Агрегация monthly_stats -> years_stats...")
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO years_stats (client_name, month, total_bytes_received, total_bytes_sent, total_connections, last_connected)
-                SELECT 
-                    ms.client_name,
-                    strftime('%Y-%m', ms.month) as agg_month,
-                    SUM(ms.total_bytes_received),
-                    SUM(ms.total_bytes_sent),
-                    SUM(ms.total_connections),
-                    MAX(ms.last_connected)
-                FROM monthly_stats ms
-                GROUP BY ms.client_name, agg_month
-                ON CONFLICT(client_name, month) DO UPDATE SET
-                    total_bytes_received = excluded.total_bytes_received,
-                    total_bytes_sent = excluded.total_bytes_sent,
-                    total_connections = excluded.total_connections,
-                    last_connected = excluded.last_connected
-            """)
-            
-            conn.commit()
-            logging.info("✅ Агрегация monthly_stats -> years_stats завершена.")
-    except Exception as e:
-        logging.error(f"❌ Ошибка при агрегации monthly->yearly: {e}")
-        raise
-
 
 def save_connection_logs(logs):
     try:
@@ -559,50 +500,6 @@ def fix_monthly_stats_uniqueness():
         logger.error(f"❌ Ошибка очистки monthly_stats: {e}")
         raise
 
-def fix_years_stats_uniqueness():
-    """
-    Удаляет дубликаты в years_stats и создаёт уникальный индекс.
-    """
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            # Агрегируем дубликаты
-            cursor.execute("""
-                CREATE TEMP TABLE IF NOT EXISTS years_stats_dedup AS
-                SELECT 
-                    client_name,
-                    month,
-                    SUM(total_bytes_received) as total_bytes_received,
-                    SUM(total_bytes_sent) as total_bytes_sent,
-                    SUM(total_connections) as total_connections,
-                    MAX(last_connected) as last_connected
-                FROM years_stats
-                GROUP BY client_name, month
-            """)
-            
-            cursor.execute("DELETE FROM years_stats")
-            
-            cursor.execute("""
-                INSERT INTO years_stats 
-                (client_name, month, total_bytes_received, total_bytes_sent, 
-                 total_connections, last_connected)
-                SELECT * FROM years_stats_dedup
-            """)
-            
-            cursor.execute("DROP TABLE IF EXISTS years_stats_dedup")
-            
-            cursor.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_years_unique 
-                ON years_stats(client_name, month)
-            """)
-            
-            conn.commit()
-            logger.info("✅ years_stats: дубликаты удалены, индекс создан")
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка очистки years_stats: {e}")
-        raise
 
 def add_unique_indexes():
     """
@@ -625,24 +522,17 @@ def add_unique_indexes():
                 ON monthly_stats(client_name, month)
             """)
             
-            # years_stats: client_name + month
-            cursor.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_years_unique 
-                ON years_stats(client_name, month)
-            """)
-            
+
             conn.commit()
             logger.info("✅ Уникальные индексы добавлены")
     except sqlite3.IntegrityError as e:
         # Если есть дубликаты — запускаем очистку
         logger.warning(f"⚠️ Найдены дубликаты, запускаю очистку: {e}")
         fix_monthly_stats_uniqueness()
-        fix_years_stats_uniqueness()
         # Повторная попытка создать индексы
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_monthly_unique ON monthly_stats(client_name, month)")
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_years_unique ON years_stats(client_name, month)")
             conn.commit()
         logger.info("✅ Индексы созданы после очистки дубликатов")
     except Exception as e:
@@ -670,9 +560,7 @@ def process_logs():
             save_daily_stats(all_logs)
             # 2. Агрегация daily -> monthly
             aggregate_daily_to_monthly()
-            # 3. Агрегация monthly -> yearly
-            aggregate_monthly_to_yearly()
-            # 4. Сохранение истории подключений (connection_logs)
+            # 3. Сохранение истории подключений (connection_logs)
             save_connection_logs(all_logs)
             logger.info("✅ Обработка завершена успешно")
         else:

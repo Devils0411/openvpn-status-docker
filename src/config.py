@@ -4,6 +4,8 @@ import os
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 class Config:
+    CLIENT_SH = "/root/web/scripts/client.sh"
+    OVPN_CLIENTS_DIR = "/root/web/openvpn/clients"
     SECRET_KEY = os.environ.get("SECRET_KEY") or "supersecretkey"
     AUDIT_DB_PATH = os.path.join(BASE_DIR, "data", "databases", "admin_audit.db")
     DATABASE_PATH = os.path.join(BASE_DIR, "data", "databases", "db.db")
@@ -20,7 +22,7 @@ class Config:
     SESSION_REFRESH_EACH_REQUEST = False
     SESSION_COOKIE_NAME = 'status_sid'
     LOG_FILES = [
-        ("/etc/openvpn/server/logs/openvpn-status.log", "UDP"),
+        ("/root/web/openvpn/log/openvpn-status.log", "UDP"),
     ]
 
 class DevelopmentConfig(Config):

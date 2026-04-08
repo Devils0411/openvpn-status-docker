@@ -6,6 +6,7 @@ import re
 import subprocess
 import logging
 
+from typing import Optional, Tuple
 from src.config import Config
 from .utils import get_color_by_percent, format_vpn_clients, parse_handshake_time, is_peer_online, read_wg_config
 
@@ -95,9 +96,10 @@ async def get_server_stats():
 <b>👥 Онлайн: </b> {clients_section}
 <b>💿 Диск:</b> {disk_used:.1f}/{disk_total:.1f} GB
 <b>⏱️ Uptime:</b> {formatted_uptime}
-🌐 Сеть ({main_interface or 'N/A'}):{traffic_text}
+🌐 Сеть ({main_interface or 'N/A'}):
 ⬇ Скорость: {format_speed(download_speed)}
 ⬆ Скорость: {format_speed(upload_speed)}
+{traffic_text}
 
 """
         return stats_text
@@ -146,12 +148,19 @@ async def get_services_status_text():
     return "\n".join(lines)
 
 
-def get_openvpn_online_clients():
+def _format_connected_dt(dt: Optional[datetime.datetime]) -> str:
+    """Краткая строка времени для сообщения в Telegram."""
+    if not dt:
+        return "—"
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def get_openvpn_online_entries():
     """Получает список активных клиентов OpenVPN из логов."""
-    clients = set()
+    entries = []
     file_paths = Config.LOG_FILES
     
-    for file_path, _ in file_paths:
+    for file_path, protocol in file_paths:
         try:
             with open(file_path, "r", encoding="utf-8") as file:
                 for line in file:
@@ -163,28 +172,88 @@ def get_openvpn_online_clients():
                         continue
                     client_name = parts[1].strip()
                     if client_name and client_name not in ["UNDEF", "Common Name"]:
-                        clients.add(client_name)
+                        connected = "—"
+                    if len(parts) > 7:
+                        try:
+                            raw = parts[7].strip()
+                            start_dt = datetime.datetime.strptime(
+                                raw, "%Y-%m-%d %H:%M:%S"
+                            )
+                            connected = _format_connected_dt(start_dt)
+                        except (ValueError, IndexError):
+                            pass
+                    entries.append(
+                        {
+                            "name": client_name,
+                            "protocol": f"OpenVPN · {protocol}",
+                            "connected": connected,
+                        }
+                    )
         except FileNotFoundError:
             logger.debug("Файл логов не найден: %s", file_path)
             continue
         except Exception as e:
             logger.error("Ошибка чтения %s: %s", file_path, e)
 
-    return sorted(clients)
+    entries.sort(key=lambda x: (x["name"].lower(), x["protocol"]))
+    return entries
 
 
-def _parse_wireguard_online_clients(output: str):
+def _wg_online_proto_and_name(
+    public_key: str,
+    iface: Optional[str],
+    vpn_mapping: dict,
+    antizapret_mapping: dict,
+) -> Tuple[str, str]:
+    """
+    Подпись и имя для пира WireGuard.
+
+    Главный критерий — интерфейс из `wg show` (фактический туннель), чтобы не
+    путать VPN и Antizapret при дубликате одного PublicKey в обоих .conf.
+    Если интерфейс не распознан — fallback по наличию ключа в конфигах.
+    """
+    n = (iface or "").strip().lower()
+
+    def name_vpn_first() -> str:
+        return (
+            vpn_mapping.get(public_key)
+            or antizapret_mapping.get(public_key)
+            or public_key
+        )
+
+    def name_az_first() -> str:
+        return (
+            antizapret_mapping.get(public_key)
+            or vpn_mapping.get(public_key)
+            or public_key
+        )
+
+    if n == "vpn":
+        return "WireGuard · VPN", name_vpn_first()
+    if n == "antizapret":
+        return "WireGuard · Antizapret", name_az_first()
+
+    if public_key in vpn_mapping:
+        return "WireGuard · VPN", name_vpn_first()
+    if public_key in antizapret_mapping:
+        return "WireGuard · Antizapret", name_az_first()
+    return "WireGuard", public_key
+
+
+def _parse_wireguard_online_entries(output: str):
     """Разобрать вывод WireGuard для онлайн-клиентов."""
-    online_clients = []
+    entries = []
     lines = (output or "").splitlines()
     
-    vpn_mapping = read_wg_config("/etc/wireguard/vpn.conf")
-    antizapret_mapping = read_wg_config("/etc/wireguard/antizapret.conf")
-    client_mapping = {**vpn_mapping, **antizapret_mapping}
+    antizapret_mapping = read_wg_config("/root/web/awg/wg0.conf")
     
     current_peer = None
+    current_interface: Optional[str] = None
     for line in lines:
         line = line.strip()
+        if line.startswith("interface:"):
+            current_interface = line.split(":", 1)[1].strip()
+            continue
         if line.startswith("peer:"):
             current_peer = line.split(":", 1)[1].strip()
             continue
@@ -192,14 +261,27 @@ def _parse_wireguard_online_clients(output: str):
             handshake_raw = line.split(":", 1)[1].strip()
             handshake_time = parse_handshake_time(handshake_raw)
             if handshake_time and is_peer_online(handshake_time):
-                online_clients.append(client_mapping.get(current_peer, current_peer))
+                proto, name = _wg_online_proto_and_name(
+                    current_peer,
+                    current_interface,
+                    vpn_mapping,
+                    antizapret_mapping,
+                )
+                entries.append(
+                    {
+                        "name": name,
+                        "protocol": proto,
+                        "connected": _format_connected_dt(handshake_time),
+                    }
+                )
             current_peer = None
-    
-    return sorted(set(online_clients))
+
+    entries.sort(key=lambda x: (x["name"].lower(), x["protocol"]))
+    return entries
 
 
-async def get_wireguard_online_clients():
-    """Получить список онлайн-клиентов WireGuard."""
+async def get_wireguard_online_entries():
+    """Получить список онлайн-клиентов WireGuard с деталями."""
     try:
         process = await asyncio.create_subprocess_exec(
             "/usr/bin/wg",
@@ -210,29 +292,34 @@ async def get_wireguard_online_clients():
         stdout, _ = await process.communicate()
         if process.returncode != 0:
             return []
-        return _parse_wireguard_online_clients(stdout.decode())
+        return _parse_wireguard_online_entries(stdout.decode())
     except Exception:
         return []
 
 
+def _format_online_line(entry: dict) -> str:
+    """Одна строка списка «кто онлайн»."""
+    return f"• <b>{entry['name']}</b> · с {entry['connected']}"
+
+
 async def get_online_clients_text():
     """Получить отформатированный текст онлайн-клиентов."""
-    openvpn_clients = get_openvpn_online_clients()
-    wg_clients = await get_wireguard_online_clients()
+    openvpn_entries = get_openvpn_online_entries()
+    wg_entries = await get_wireguard_online_entries()
     
     lines = ["<b>👥 Кто онлайн:</b>", ""]
     
-    if openvpn_clients:
+    if openvpn_entries:
         lines.append("<b>OpenVPN:</b>")
-        lines.extend([f"• {client}" for client in openvpn_clients])
+        lines.extend(_format_online_line(e) for e in openvpn_entries)
     else:
         lines.append("<b>OpenVPN:</b> нет активных клиентов")
     
     lines.append("")
     
-    if wg_clients:
+    if wg_entries:
         lines.append("<b>WireGuard:</b>")
-        lines.extend([f"• {client}" for client in wg_clients])
+        lines.extend(_format_online_line(e) for e in wg_entries)
     else:
         lines.append("<b>WireGuard:</b> нет активных клиентов")
     

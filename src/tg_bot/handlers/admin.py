@@ -8,7 +8,7 @@ from aiogram.types import FSInputFile
 from aiogram.fsm.context import FSMContext
 import logging
 
-from ..config import get_admin_ids, ITEMS_PER_PAGE, set_client_mapping
+from ..config import get_admin_ids, ITEMS_PER_PAGE, set_client_mapping, remove_client_mapping
 from ..keyboards import (
     create_main_menu,
     create_client_list_keyboard,

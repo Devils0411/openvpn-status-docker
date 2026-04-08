@@ -1,28 +1,50 @@
 {% extends "base.html" %}
 
+{% block title %}Настройки · Журнал{% endblock %}
+
+{% block page_title %}Настройки{% endblock %}
+
+{% block page_subtitle %}
+<p class="app-topbar__subtitle text-truncate">Журнал</p>
+{% endblock %}
+
 {% block content %}
 
-<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-  <h2>Настройки</h2>
-</div>
+<div class="dash-mon settings-shell">
+  <header class="dash-mon__hero">
+    <nav class="settings-tabs" aria-label="Разделы настроек">
+      <a href="{{ url_for('settings') }}" class="settings-tab {% if active_page == 'settings' %}active{% endif %}">Общие</a>
+      <a href="{{ url_for('settings_telegram') }}" class="settings-tab {% if active_page == 'settings_telegram' %}active{% endif %}">Телеграм</a>
+      <a href="{{ url_for('settings_audit') }}" class="settings-tab {% if active_page == 'settings_audit' %}active{% endif %}">Журнал</a>
+    </nav>
+  </header>
 
-<div class="tabs mb-3">
-  <a href="{{ url_for('settings') }}" class="tab {% if active_page == 'settings' %}active{% endif %}">Общие</a>
-  <a href="{{ url_for('settings_telegram') }}" class="tab {% if active_page == 'settings_telegram' %}active{% endif %}">Телеграм</a>
-  <a href="{{ url_for('settings_audit') }}" class="tab {% if active_page == 'settings_audit' %}active{% endif %}">Журнал</a>
-</div>
 
-<div class="container">
-  <div class="mb-4 p-3 border rounded">
-    <h4 class="mb-3">Журнал действий</h4>
+  <section class="dash-panel mb-3">
+    <div class="dash-panel__hd mb-2">
+      <i class="bi bi-journal-text dash-panel__hd-ic text-primary" aria-hidden="true"></i>
+      <span class="dash-panel__hd-t">Журнал действий</span>
+    </div>
 
-    <div class="mb-3 d-flex gap-2 flex-wrap align-items-center">
-      <select class="form-select form-select-sm" onchange="location=this.value;">
+    <div class="d-flex align-items-center gap-2 mb-3">
+      <select class="form-select form-select-sm flex-grow-1" onchange="location=this.value;">
         <option value="?action=all" {% if not action_filter or action_filter=='all' %}selected{% endif %} disabled selected>Выберите действие</option>
         {% for action_key, action_name in action_labels.items() %}
         <option value="?action={{ action_key }}" {% if action_filter==action_key %}selected{% endif %}>{{ action_name }}</option>
         {% endfor %}
       </select>
+      <a class="btn btn-sm btn-outline-secondary flex-shrink-0" data-bs-toggle="collapse" href="#auditHint"
+        role="button" aria-expanded="false" aria-controls="auditHint" title="Подсказка">
+        <i class="bi bi-question-circle"></i>
+      </a>
+    </div>
+
+    <div class="collapse mb-3" id="auditHint">
+      <div class="alert alert-info py-2 px-3 small mb-0">
+        <ul class="mb-0 ps-3">
+          <li>В журнале отображаются действия администраторов Telegram-бота и веб-интерфейса.</li>
+        </ul>
+      </div>
     </div>
 
     {% if logs %}
@@ -35,7 +57,6 @@
             <th>Администратор</th>
             <th>Действие</th>
             <th>Детали</th>
-            <th>IP-адрес</th>
           </tr>
         </thead>
         <tbody>
@@ -71,19 +92,38 @@
               <span class="badge bg-success">Одобрено</span>
               {% elif log.action == 'request_reject' %}
               <span class="badge bg-danger">Отклонено</span>
+              {% elif log.action == 'stats_db_clear_ovpn' %}
+              <span class="badge bg-warning text-dark">Очистка OpenVPN</span>
+              {% elif log.action == 'stats_db_clear_wg' %}
+              <span class="badge bg-warning text-dark">Очистка WireGuard</span>
+              {% elif log.action == 'bot_token_change' %}
+              <span class="badge bg-dark">Токен бота</span>
+              {% elif log.action == 'bot_admins_change' %}
+              <span class="badge bg-primary">Админ Telegram</span>             
               {% else %}
               {{ log.action }}
               {% endif %}
             </td>
-            <td>{{ log.details or '—' }}</td>
-            <td>{{ log.ip_address or '—' }}</td>
+            <td>
+              {% if log.details %}
+                {{ log.details }}
+              {% endif %}
+
+              {% if log.ip_address %}
+                {% if log.details %}<br>{% endif %}
+                IP: {{ log.ip_address }}
+              {% endif %}
+
+              {% if not log.details and not log.ip_address %}
+                —
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
 
-    <!-- Пагинация -->
     {% if total_pages > 1 %}
     <nav aria-label="Навигация по страницам">
       <ul class="pagination justify-content-center mb-0">
@@ -115,7 +155,7 @@
       <p class="mb-0">Записей пока нет.</p>
     </div>
     {% endif %}
-  </div>
+  </section>
 </div>
 
 <script>

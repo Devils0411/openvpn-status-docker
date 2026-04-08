@@ -40,7 +40,9 @@ def get_dispatcher():
 def _register_handlers(dp):
     """Зарегистрировать все обработчики в диспетчере."""
     from .handlers import common, menus, server, vpn, admin
-    
+    from .middlewares import UnlistedUserSilenceMiddleware
+
+    dp.update.outer_middleware(UnlistedUserSilenceMiddleware())    
     dp.include_router(common.router)
     dp.include_router(menus.router)
     dp.include_router(server.router)
@@ -116,6 +118,17 @@ async def update_bot_about():
     async with Bot(token=token) as bot:
         await bot.set_my_short_description(about, language_code="ru")
         logger.debug("✅ Раздел «О боте» обновлён")
+
+
+async def seed_bot_profile_if_needed():
+    """Один раз задать описание и «о боте» """
+    from .config import is_tg_bot_profile_seeded, mark_tg_bot_profile_seeded
+
+    if is_tg_bot_profile_seeded():
+        return
+    await update_bot_description()
+    await update_bot_about()
+    mark_tg_bot_profile_seeded()
 
 
 async def set_bot_commands():

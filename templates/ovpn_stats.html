@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block title %}Статистика{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h2>Статистика клиентов OpenVPN</h2>
+</div>
+
+<div class="tabs mb-3">
+    <a href="{{ url_for('ovpn') }}" class="tab {% if active_page == 'ovpn' %}active{% endif %}">Клиенты</a>
+    <a href="{{ url_for('ovpn_history') }}" class="tab {% if active_page == 'history' %}active{% endif %}">История</a>
+    <a href="{{ url_for('ovpn_stats') }}" class="tab {% if active_page == 'stats' %}active{% endif %}">Статистика</a>
+</div>
+
+{% if error_message %}
+<div class="alert alert-danger" role="alert">
+    {{ error_message }}
+</div>
+{% else %}
+
+<div class="stats-container mx-auto">
+    <!-- Поле фильтрации -->
+    <div class="mb-3">
+        <input type="text" id="clientFilter" class="form-control" placeholder="Фильтр по имени клиента...">
+    </div>
+
+    <div class="table-responsive ovpn_table log_table w-100">
+        {% for month, stats in month_stats.items() %}
+        <table class="table client-table table-hover table-sm align-middle">
+            <thead>
+                <tr>
+                  <th class="text-center">
+                    <a href="?sort=client_name&order={{ 'desc' if sort_by == 'client_name' and order == 'asc' else 'asc' }}">
+                      Клиент
+                      {% if sort_by == 'client_name' %}
+                        <i class="fa {{ 'fa-sort-amount-asc' if order == 'desc' else 'fa-sort-amount-desc' }}"></i>
+                      {% endif %}
+                    </a>
+                  </th>
+              
+                  <th class="text-center">
+                    <a href="?sort=total_bytes_sent&order={{ 'desc' if sort_by == 'total_bytes_sent' and order == 'asc' else 'asc' }}">
+                      Передано
+                      {% if sort_by == 'total_bytes_sent' %}
+                        <i class="fa {{ 'fa-sort-amount-asc' if order == 'desc' else 'fa-sort-amount-desc' }}"></i>
+                      {% endif %}
+                    </a>
+                  </th>
+              
+                  <th class="text-center">
+                    <a href="?sort=total_bytes_received&order={{ 'desc' if sort_by == 'total_bytes_received' and order == 'asc' else 'asc' }}">
+                      Получено
+                      {% if sort_by == 'total_bytes_received' %}
+                        <i class="fa {{ 'fa-sort-amount-asc' if order == 'desc' else 'fa-sort-amount-desc' }}"></i>
+                      {% endif %}
+                    </a>
+                  </th>
+              
+                  <th class="text-center">Месяц подключения</th>
+              
+                  <th class="text-center">
+                    <a href="?sort=last_connected&order={{ 'desc' if sort_by == 'last_connected' and order == 'asc' else 'asc' }}">
+                      Последнее подключение
+                      {% if sort_by == 'last_connected' %}
+                        <i class="fa {{ 'fa-sort-amount-asc' if order == 'desc' else 'fa-sort-amount-desc' }}"></i>
+                      {% endif %}
+                    </a>
+                  </th>
+                </tr>
+              </thead>
+            <tbody>
+                {% for client in stats %}
+                {% if client['client_name'] != 'UNDEF' %}
+                <tr>
+                    <td class="client-name text-center">{{ client['client_name'] }}</td>
+                    <td class="text-center">{{ client['total_bytes_sent'] }}</td>
+                    <td class="text-center">{{ client['total_bytes_received'] }}</td>
+                    <td class="text-center">{{ month }}</td>
+                    <td class="text-center">
+                        {% if client['last_connected'] %}
+                        <span class="connection-time" data-utc="{{ client['last_connected'] }}">Загрузка...</span>
+                        {% else %}
+                        <span>Нет данных</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<script src="{{ url_for('static', filename='js/ovpn_stats.js') }}"></script>
+
+{% endblock %}

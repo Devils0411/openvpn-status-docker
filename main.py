@@ -1,7 +1,9 @@
+import base64
 import csv
 import sqlite3
 import requests
 import os
+import platform
 import re
 import threading
 import random
@@ -28,8 +30,10 @@ from flask_login import (
 )
 from flask import (
     Flask,
+    abort,
     make_response,
     render_template,
+    send_file,
     url_for,
     redirect,
     request,
@@ -42,7 +46,9 @@ from src.tg_bot.audit import log_action, get_logs, get_logs_count
 from flask_bcrypt import Bcrypt
 from datetime import date, datetime, timezone, timedelta
 from zoneinfo._common import ZoneInfoNotFoundError
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 
 # ============================================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ С РАЗДЕЛЕНИЕМ ПО УРОВНЯМ И РОТАЦИЕЙ ФАЙЛОВ
@@ -70,7 +76,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.propagate = False
 
-# ⚠️ КРИТИЧНО: Очищаем handlers ТОЛЬКО если они уже есть
+# Очищаем handlers ТОЛЬКО если они уже есть
 if logger.handlers:
     logger.handlers.clear()
 
@@ -135,6 +141,8 @@ loginManager.login_view = "login"
 
 # Получаем LOG_FILES из конфигурации
 LOG_FILES = Config.LOG_FILES
+CLIENT_SH_PATH = Config.CLIENT_SH
+OPENVPN_CONFIG_PATHS = Config.OVPN_CLIENTS_DIR
 
 # Переменная для хранения кэшированных данных
 cached_system_info = None
@@ -168,6 +176,25 @@ SETTINGS_PATH = Config.SETTINGS_PATH
 LEGACY_ADMIN_INFO_PATH = Config.LEGACY_ADMIN_INFO_PATH
 CLIENT_MAPPING_KEY = "CLIENT_MAPPING"
 
+
+
+def _host_static_info():
+    os_label = ""
+    try:
+        rel = platform.freedesktop_os_release()
+        os_label = (
+            rel.get("PRETTY_NAME")
+            or f"{rel.get('NAME', 'Linux')} {rel.get('VERSION', '')}".strip()
+        )
+    except (OSError, AttributeError):
+        os_label = f"{platform.system()} {platform.release()}".strip()
+    physical = psutil.cpu_count(logical=False)
+    logical = psutil.cpu_count(logical=True)
+    cpu_cores = physical if physical else (logical or 1)
+    return {"os_label": os_label, "cpu_cores": cpu_cores}
+
+
+HOST_STATIC_INFO = _host_static_info()
 
 def read_env_values():
     values = {}
@@ -246,8 +273,14 @@ DEFAULT_SETTINGS = {
     "bot_enabled": False,
     "hide_ovpn_ip": True,
     "hide_wg_ip": True,
+    "stats_retention_days": 365,
 }
 
+MONTH_OPTIONS_RU = [
+    (1, "Январь"), (2, "Февраль"), (3, "Март"), (4, "Апрель"),
+    (5, "Май"), (6, "Июнь"), (7, "Июль"), (8, "Август"),
+    (9, "Сентябрь"), (10, "Октябрь"), (11, "Ноябрь"), (12, "Декабрь"),
+]
 
 def write_settings_data(settings_data):
     try:
@@ -303,6 +336,52 @@ def write_settings(updated_settings):
     current_settings = read_settings()
     current_settings.update(updated_settings)
     write_settings_data(current_settings)
+
+
+def parse_stats_retention_days(raw_value):
+    try:
+        days = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return 365
+    return max(30, min(days, 3650))
+
+
+def get_stats_retention_days():
+    return parse_stats_retention_days(read_settings().get("stats_retention_days", 365))
+
+
+def get_available_stat_years(db_path, table_name, date_column):
+    years = []
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT substr({date_column}, 1, 4) AS y
+                FROM {table_name}
+                WHERE substr({date_column}, 1, 4) GLOB '[0-9][0-9][0-9][0-9]'
+                ORDER BY y DESC
+                """
+            ).fetchall()
+            years = [int(row[0]) for row in rows if row and row[0].isdigit()]
+    except sqlite3.Error:
+        years = []
+
+    current_year = datetime.now().year
+    if current_year not in years:
+        years.append(current_year)
+    years = sorted(set(years), reverse=True)
+    return years
+
+
+
+def parse_date_yyyy_mm_dd(raw_value):
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def read_admin_info():
@@ -732,150 +811,102 @@ def parse_relative_time(relative_time):
 
 
 def read_wg_config(file_path):
-    """Считывает клиентские данные из конфигурационного файла WireGuard."""
+    """Считывает клиентские данные из JSON конфигурационного файла WireGuard."""
     client_mapping = {}
     try:
         with open(file_path, "r", encoding="utf-8") as file:
-            current_client_name = None
-
-            for line in file:
-                line = line.strip()
-
-                # Если строка начинается с # Client =, то сохраняем имя клиента
-                if line.startswith("# Client ="):
-                    current_client_name = line.split("=", 1)[1].strip()
-
-                # Если строка начинается с [Peer], сбрасываем имя клиента
-                elif line.startswith("[Peer]"):
-                    # Проверяем, есть ли имя клиента, если нет, то оставляем 'N/A'
-                    current_client_name = current_client_name or "N/A"
-
-                # Если строка начинается с PublicKey =, сохраняем публичный ключ с именем клиента
-                elif line.startswith("PublicKey =") and current_client_name:
-                    public_key = line.split("=", 1)[1].strip()
-                    client_mapping[public_key] = current_client_name
-
+            data = json.load(file)
+            
+        # Убираем пробелы из ключей верхнего уровня (на случай "clients ")
+        data = {k.strip(): v for k, v in data.items()}
+        
+        clients = data.get("clients", {})
+        for client_id, client_info in clients.items():
+            # Очищаем ключи и строковые значения от пробелов
+            clean_info = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in client_info.items()}
+            
+            public_key = clean_info.get("publicKey", "").strip()
+            name = clean_info.get("name", "N/A").strip()
+            address = clean_info.get("address", "N/A").strip()
+            
+            if public_key:
+                client_mapping[public_key] = {
+                    "name": name,
+                    "address": address
+                }
     except FileNotFoundError:
         logger.warning(f"⚠️ Конфигурационный файл {file_path} не найден.")
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Ошибка парсинга JSON {file_path}: {e}")
     except Exception as e:
         logger.error(f"❌ Ошибка чтения конфига WireGuard {file_path}: {e}")
-
     return client_mapping
 
 # ========= WireGuard Toggle Functions =========
 def get_disabled_wg_peers():
-    """Получает отключённых пиров из конфигурационных файлов WireGuard."""
-    configs = {
-        "antizapret": "/root/web/awg/wg0.conf",
-    }
+    """Получает отключённых пиров из JSON конфигурационного файла WireGuard."""
+    json_path = "/root/web/awg/wg0.json"
     result = {}
-    for interface, config_path in configs.items():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            continue
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Убираем лишние пробелы из ключей верхнего уровня
+        data = {k.strip(): v for k, v in data.items()}
+        clients = data.get("clients", {})
 
         disabled = []
-        i = 0
-        while i < len(lines):
-            s = lines[i].strip()
-            if s.startswith("# Client ="):
-                client_name = s.split("=", 1)[1].strip()
-                for j in range(i + 1, min(i + 3, len(lines))):
-                    if lines[j].strip().startswith("#~ [Peer]"):
-                        public_key = None
-                        allowed_ips = []
-                        for k in range(j + 1, min(j + 10, len(lines))):
-                            ks = lines[k].strip()
-                            if ks.startswith("#~ PublicKey ="):
-                                public_key = ks.split("=", 1)[1].strip()
-                            elif ks.startswith("#~ AllowedIPs ="):
-                                allowed_ips = [ip.strip() for ip in ks.split("=", 1)[1].strip().split(",")]
-                            elif not ks.startswith("#~") and ks != "":
-                                break
-                        if public_key:
-                            masked = public_key[:4] + "..." + public_key[-4:]
-                            disabled.append({
-                                "peer": public_key,
-                                "masked_peer": masked,
-                                "client": client_name,
-                                "enabled": False,
-                                "online": False,
-                                "endpoint": "N/A",
-                                "visible_ips": allowed_ips[:1],
-                                "hidden_ips": allowed_ips[1:],
-                                "latest_handshake": None,
-                                "daily_received": "0 B",
-                                "daily_sent": "0 B",
-                                "received": "0 B",
-                                "sent": "0 B",
-                                "received_bytes": 0,
-                                "sent_bytes": 0,
-                                "daily_traffic_percentage": 0,
-                                "received_percentage": 0,
-                                "sent_percentage": 0,
-                                "allowed_ips": allowed_ips,
-                            })
-                        break
-            i += 1
+        for client_id, client_info in clients.items():
+            # Очищаем ключи и строковые значения от пробелов
+            clean_info = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in client_info.items()}
+
+            # Проверяем статус enabled (по умолчанию True, если поле отсутствует)
+            if not clean_info.get("enabled", True):
+                public_key = clean_info.get("publicKey", "").strip()
+                name = clean_info.get("name", "N/A").strip()
+                address = clean_info.get("address", "N/A").strip()
+
+                if public_key:
+                    masked = public_key[:4] + "..." + public_key[-4:] if len(public_key) > 8 else public_key
+                    
+                    # Формируем список AllowedIPs (берём назначенный адрес клиента)
+                    allowed_ips = [address] if address and address != "N/A" else []
+
+                    disabled.append({
+                        "peer": public_key,
+                        "masked_peer": masked,
+                        "client": name,
+                        "enabled": False,
+                        "online": False,
+                        "endpoint": "N/A",
+                        "visible_ips": allowed_ips[:1],
+                        "hidden_ips": allowed_ips[1:],
+                        "latest_handshake": None,
+                        "daily_received": "0 B",
+                        "daily_sent": "0 B",
+                        "received": "0 B",
+                        "sent": "0 B",
+                        "received_bytes": 0,
+                        "sent_bytes": 0,
+                        "daily_traffic_percentage": 0,
+                        "received_percentage": 0,
+                        "sent_percentage": 0,
+                        "allowed_ips": allowed_ips,
+                    })
+
+        # Привязываем к интерфейсу wg0 (должно совпадать с выводом команды `wg show`)
         if disabled:
-            result[interface] = disabled
+            result["wg0"] = disabled
+
+    except FileNotFoundError:
+        logger.warning(f"⚠️ Файл конфигурации {json_path} не найден.")
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Ошибка парсинга JSON {json_path}: {e}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения конфига WireGuard {json_path}: {e}")
+
     return result
-
-def toggle_peer_config(config_path, public_key, enable):
-    """Включает или отключает пир в конфигурационном файле WireGuard."""
-    with open(config_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    
-    key_line_idx = None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        clean = s.replace("#~ ", "", 1) if s.startswith("#~ ") else s
-        if clean.startswith("PublicKey =") and public_key in clean:
-            key_line_idx = i
-            break
-    
-    if key_line_idx is None:
-        return False
-
-    block_start = key_line_idx
-    for i in range(key_line_idx - 1, -1, -1):
-        s = lines[i].strip()
-        if s.startswith("# Client ="):
-            block_start = i
-            break
-        elif s.startswith("[Peer]") or s.startswith("#~ [Peer]"):
-            block_start = i
-            break
-
-    block_end = key_line_idx + 1
-    for i in range(key_line_idx + 1, len(lines)):
-        s = lines[i].strip()
-        if s.startswith("# Client =") or s.startswith("[Interface]") or s.startswith("[Peer]"):
-            block_end = i
-            break
-        block_end = i + 1
-
-    new_lines = lines[:block_start]
-    for i in range(block_start, block_end):
-        line = lines[i]
-        s = line.strip()
-        if enable:
-            if s.startswith("#~ "):
-                new_lines.append(line.replace("#~ ", "", 1))
-            else:
-                new_lines.append(line)
-        else:
-            if s == "" or s.startswith("#"):
-                new_lines.append(line)
-            else:
-                new_lines.append("#~ " + line.lstrip())
-    new_lines.extend(lines[block_end:])
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-    return True
 
 def get_daily_stats_map():
     """Получение ежедневной статистики WG"""
@@ -903,30 +934,30 @@ def parse_wireguard_output(output, hide_ip=True):
     stats = []
     lines = output.strip().splitlines()
     interface_data = {}
-    vpn_mapping = read_wg_config("/etc/wireguard/vpn.conf")
-    antizapret_mapping = read_wg_config("/etc/wireguard/antizapret.conf")
-    client_mapping = {**vpn_mapping, **antizapret_mapping}
+    client_mapping = read_wg_config("/root/web/awg/wg0.json")
     daily_stats_map = get_daily_stats_map()
     
     for line in lines:
         line = line.strip()
-        if line.startswith("interface:"):
+        if line.startswith("interface: "):
             if interface_data:
                 stats.append(interface_data)
                 interface_data = {}
-            interface_data["interface"] = line.split(":  ")[1]
-        elif line.startswith("public key:"):
-            public_key = line.split(":  ")[1]
+            interface_data["interface"] = line.split(": ", 1)[1].strip()
+        elif line.startswith("public key: "):
+            public_key = line.split(": ", 1)[1].strip()
             interface_data["public_key"] = public_key
-        elif line.startswith("listening port:"):
-            interface_data["listening_port"] = line.split(":  ")[1]
-        elif line.startswith("peer:"):
+        elif line.startswith("listening port: "):
+            interface_data["listening_port"] = line.split(": ", 1)[1].strip()
+        elif line.startswith("peer: "):
             if "peers" not in interface_data:
                 interface_data["peers"] = []
-            peer_data = {"peer": line.split(":  ")[1].strip()}
+            peer_data = {"peer": line.split(": ", 1)[1].strip()}
             masked_peer = peer_data["peer"][:4] + "..." + peer_data["peer"][-4:]
             peer_data["masked_peer"] = masked_peer
-            peer_data["client"] = client_mapping.get(peer_data["peer"], "N/A")
+            client_info = client_mapping.get(peer_data["peer"], {"name": "N/A", "address": "N/A"})
+            peer_data["client"] = client_info["name"]
+            peer_data["assigned_address"] = client_info["address"]
 
             daily_row = daily_stats_map.get(
                 (peer_data["peer"], interface_data["interface"])
@@ -949,42 +980,62 @@ def parse_wireguard_output(output, hide_ip=True):
                 peer_data["daily_traffic_percentage"] = 0
             interface_data["peers"].append(peer_data)
         elif line.startswith("endpoint:"):
-            peer_data["endpoint"] = mask_ip(line.split(":")[1].strip(), hide=hide_ip)
-        elif line.startswith("allowed ips:"):
-            allowed_ips = line.split(":  ")[1].split(",  ")
+            parts = line.split(":", 1)
+            raw_endpoint = parts[1].strip() if len(parts) > 1 else ""
+            ip_only = raw_endpoint.rsplit(":", 1)[0].strip("[] ") if raw_endpoint else ""
+            peer_data["endpoint"] = mask_ip(ip_only, hide=hide_ip)
+        elif line.startswith("allowed ips: "):
+            if ": " in line:
+                ips_part = line.split(": ", 1)[1].strip()
+                allowed_ips = [ip.strip() for ip in ips_part.split(", ") if ip.strip()]
+            else:
+                allowed_ips = []
             peer_data["allowed_ips"] = allowed_ips
             peer_data["visible_ips"] = allowed_ips[:1]
             peer_data["hidden_ips"] = allowed_ips[1:]
-        elif line.startswith("latest handshake:"):
-            handshake_time = line.split(":  ")[1].strip()
+        elif line.startswith("latest handshake: "):
+            parts = line.split(":", 1)
+            handshake_time = parts[1].strip() if len(parts) > 1 else ""
 
-            if handshake_time.lower() == "now":
+            if not handshake_time:
+                peer_data["latest_handshake"] = "Никогда"
+                peer_data["online"] = False
+            elif handshake_time.lower() == "now":
                 formatted_handshake_time = datetime.now()
                 peer_data["latest_handshake"] = "Now"
                 peer_data["online"] = True
-
             elif any(
                 unit in handshake_time
-                for unit in ["мин", "час", "сек", "minute", "hour", "second", "day", "week"]
+                for unit in ["мин", "час", "сек", "minute", "hour", "second", "day", "week", "год", "year"]
             ):
-                formatted_handshake_time = parse_relative_time(handshake_time)
-                peer_data["latest_handshake"] = format_handshake_time(handshake_time)
-                peer_data["online"] = is_peer_online(formatted_handshake_time)
-
+                try:
+                    formatted_handshake_time = parse_relative_time(handshake_time)
+                    peer_data["latest_handshake"] = format_handshake_time(handshake_time)
+                    peer_data["online"] = is_peer_online(formatted_handshake_time)
+                except Exception:
+                    peer_data["latest_handshake"] = handshake_time
+                    peer_data["online"] = False
             else:
-                formatted_handshake_time = datetime.strptime(
-                    handshake_time, "%Y-%m-%d %H:%M:%S"
-                )
-                peer_data["latest_handshake"] = format_handshake_time(handshake_time)
-                peer_data["online"] = is_peer_online(formatted_handshake_time)
-    
-        elif line.startswith("transfer:"):
-            transfer_data = line.split(": ")[1].strip().split(",  ")
-            received = transfer_data[0].replace(" received", " ").strip()
-            sent = transfer_data[1].replace(" sent", " ").strip()
+                try:
+                    formatted_handshake_time = datetime.strptime(
+                        handshake_time, "%Y-%m-%d %H:%M:%S"
+                    )
+                    peer_data["latest_handshake"] = format_handshake_time(handshake_time)
+                    peer_data["online"] = is_peer_online(formatted_handshake_time)
+                except ValueError:
+                    peer_data["latest_handshake"] = handshake_time
+                    peer_data["online"] = False
+        elif line.startswith("transfer: "):
+            if ": " in line:
+                transfer_part = line.split(": ", 1)[1].strip()
+                transfer_data = [p.strip() for p in transfer_part.split(", ")]
+            else:
+                transfer_data = []
+            received = transfer_data[0].replace(" received", "").strip() if len(transfer_data) > 0 else "0 B"
+            sent = transfer_data[1].replace(" sent", "").strip() if len(transfer_data) > 1 else "0 B"
 
-            received_str = transfer_data[0].replace(" received", " ").strip()
-            sent_str = transfer_data[1].replace(" sent", " ").strip()
+            received_str = transfer_data[0].replace(" received", "").strip()
+            sent_str = transfer_data[1].replace(" sent", "").strip()
 
             # Конвертируем строки в байты
             peer_data["received_bytes"] = (
@@ -1050,18 +1101,31 @@ def format_bytes(size):
 
 def parse_bytes(value):
     """Преобразует строку с размером данных в байты."""
-    size, unit = value.split("  ")
-    size = float(size)
-    unit = unit.lower()
-    if unit == "kb":
-        return size * 1024
-    elif unit == "mb":
-        return size * 1024 ** 2
-    elif unit == "gb":
-        return size * 1024 ** 3
-    elif unit == "tb":
-        return size * 1024 ** 4
-    return size
+    if not value or not isinstance(value, str):
+        return 0
+    try:
+        # .split() без аргументов автоматически разбивает по любым пробелам и удаляет пустые строки
+        parts = value.split()
+        if len(parts) != 2:
+            return 0
+        size = float(parts[0])
+        unit = parts[1].lower()
+        
+        # Поддерживаем стандартные и двоичные приставки
+        if unit in ("kb", "kib"):
+            return size * 1024
+        elif unit in ("mb", "mib"):
+            return size * 1024 ** 2
+        elif unit in ("gb", "gib"):
+            return size * 1024 ** 3
+        elif unit in ("tb", "tib"):
+            return size * 1024 ** 4
+        elif unit in ("pb", "pib"):
+            return size * 1024 ** 5
+        return size  # Если единиц нет или это байты (B)
+    except (ValueError, IndexError, TypeError) as e:
+        logger.warning(f"⚠️ Не удалось распарсить размер '{value}': {e}")
+        return 0
 
 
 # Функция для склонения слова "клиент"
@@ -1074,6 +1138,10 @@ def pluralize_clients(count):
         return f"{count} клиента"
     else:
         return f"{count} клиентов"
+
+def _ovpn_session_row_key(name, protocol):
+    raw = f"{name}\x1f{protocol}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 # Функция для получения внешнего IP-адреса
@@ -1287,6 +1355,74 @@ def ensure_db():
     conn.close()
 
 
+# Очистка БД статистики
+STATS_DB_CLEAR_OVPN_PHRASE = "OpenVPN"
+STATS_DB_CLEAR_WG_PHRASE = "WireGuard"
+
+
+def get_ovpn_wg_database_sizes():
+    """Размеры файлов БД статистики OpenVPN и WireGuard (без путей в UI)."""
+    specs = [
+        ("ovpn", "OpenVPN", app.config["LOGS_DATABASE_PATH"]),
+        ("wg", "WireGuard", app.config["WG_STATS_PATH"]),
+    ]
+    items = []
+    total = 0
+    for key, label, path in specs:
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            sz = 0
+        total += sz
+        items.append(
+            {
+                "key": key,
+                "label": label,
+                "bytes": sz,
+                "size_fmt": format_bytes(sz),
+            }
+        )
+    return items, total
+
+
+def _delete_tables_and_vacuum(db_path, tables):
+    with sqlite3.connect(db_path) as conn:
+        for t in tables:
+            try:
+                conn.execute(f"DELETE FROM {t}")
+            except sqlite3.OperationalError:
+                pass
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
+def clear_openvpn_stats_database():
+    """Очищает openvpn_logs.db."""
+    try:
+        _delete_tables_and_vacuum(
+            app.config["LOGS_DATABASE_PATH"],
+            ("monthly_stats", "connection_logs", "last_client_stats"),
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def clear_wireguard_stats_database():
+    """Очищает wireguard_stats.db."""
+    try:
+        _delete_tables_and_vacuum(
+            app.config["WG_STATS_PATH"],
+            ("wg_daily_stats", "wg_intermediate", "wg_total_stats"),
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def save_minute_average_to_db():
     """Сохраняет средние значения CPU и RAM за последний интервал в БД."""
     now = datetime.now()
@@ -1491,27 +1627,42 @@ def format_uptime(uptime_string):
 def count_online_clients(file_paths):
     total_openvpn = 0
     results = {}
+
     # Подсчёт WireGuard
-#    try:
-#        wg_output = subprocess.check_output(["/usr/bin/wg", "show"], text=True)
-#        wg_latest_handshakes = re.findall(r"latest handshake: (.+)", wg_output)
-#        online_wg = 0
-#        for handshake in wg_latest_handshakes:
-#            handshake_str = handshake.strip()
-#            if handshake_str == "0 seconds ago":
-#                online_wg += 1
-#            else:
-#                try:
-                    # Используем parse_relative_time и is_peer_online для определения онлайн-статуса
-#                    handshake_time = parse_relative_time(handshake_str)
-#                    if is_peer_online(handshake_time):
-#                        online_wg += 1
-#                except Exception:
-#                    continue
-#        results["WireGuard"] = online_wg
-#    except Exception as e:
-#        logger.error(f"❌ Ошибка подсчёта клиентов WireGuard: {e}")
-#        results["WireGuard"] = 0
+    try:
+        id_result = subprocess.run(
+            ['docker', 'ps', '--filter', 'name=amnezia', '--format', '{{.ID}}'],
+            capture_output=True, text=True, check=True
+        )
+        container_id = id_result.stdout.strip().splitlines()[0] if id_result.stdout.strip() else None
+        
+        if not container_id:
+            return "Ошибка: Контейнер amnezia не найден"
+
+        # 2. Выполняем wg show внутри контейнера
+        result = subprocess.run(
+            ['docker', 'exec', container_id, '/usr/bin/wg', 'show'],
+            capture_output=True, text=True, check=True
+        )
+        wg_output = result.stdout
+        wg_latest_handshakes = re.findall(r"latest handshake: (.+)", wg_output)
+        online_wg = 0
+        for handshake in wg_latest_handshakes:
+            handshake_str = handshake.strip()
+            if handshake_str == "0 seconds ago":
+                online_wg += 1
+            else:
+                try:
+                   # Используем parse_relative_time и is_peer_online для определения онлайн-статуса
+                    handshake_time = parse_relative_time(handshake_str)
+                    if is_peer_online(handshake_time):
+                        online_wg += 1
+                except Exception:
+                    continue
+        results["WireGuard"] = online_wg
+    except Exception as e:
+        logger.error(f"❌ Ошибка подсчёта клиентов WireGuard: {e}")
+        results["WireGuard"] = 0
     
     # Подсчёт OpenVPN
     for path, _ in file_paths:
@@ -1525,8 +1676,8 @@ def count_online_clients(file_paths):
             continue
 
     results["OpenVPN"] = total_openvpn
-    logger.debug(f"📊 Онлайн клиенты: OVPN={results['OpenVPN']}")
-#    logger.debug(f"📊 Онлайн клиенты: WG={results['WireGuard']}, OVPN={results['OpenVPN']}")
+#    logger.debug(f"📊 Онлайн клиенты: OVPN={results['OpenVPN']}")
+    logger.debug(f"📊 Онлайн клиенты: WG={results['WireGuard']}, OVPN={results['OpenVPN']}")
     return results
 
 # Метрики для статистики скорости для активных пользователей OpenVPN
@@ -1671,19 +1822,19 @@ def update_system_info():
                 cpu_history.pop(0)  # удаляем старые записи
 
             interface = get_default_interface()
-            # Проверяем, чтобы интерфейс не начинался с lo, docker, veth, br-
-            if interface and not interface.startswith(("lo", "docker", "veth", "br-")):
-                network_stats = get_network_stats(interface) if interface else None
-            else:
-                network_stats = None
+            network_stats = get_network_stats(interface) if interface else None
             vpn_clients = count_online_clients(LOG_FILES)
 
+            _mem = psutil.virtual_memory()
+            _disk = psutil.disk_usage("/")
             cached_system_info = {
-                "cpu_load": cpu_percent,
-                "memory_used": psutil.virtual_memory().used // (1024 ** 2),
-                "memory_total": psutil.virtual_memory().total // (1024 ** 2),
-                "disk_used": psutil.disk_usage("/").used // (1024 ** 3),
-                "disk_total": psutil.disk_usage("/").total // (1024 ** 3),
+                **HOST_STATIC_INFO,
+                "cpu_load": round(cpu_percent, 1),
+                "memory_used": _mem.used // (1024**2),
+                "memory_total": _mem.total // (1024**2),
+                "memory_percent": round(_mem.percent, 1),
+                "disk_used": round(_disk.used / (1024**3), 1),
+                "disk_total": round(_disk.total / (1024**3), 1),
                 "network_load": get_network_load(),
                 "uptime": format_uptime(get_uptime()),
                 "network_interface": interface or "Не найдено",
@@ -1974,44 +2125,99 @@ def home():
 @app.route("/settings", methods=["GET", "POST"])
 @login_required
 def settings():
-    app_message = None
-    app_error = None
-    ip_message = None
-    
+    settings_message = None
+    settings_error = None
+    stats_db_message = None
+    stats_db_error = None
+
     if request.method == "POST":
         form_type = request.form.get("form_type")
-        
-        if form_type == "app_name":
+
+        if form_type == "settings_all":
             app_name = request.form.get("app_name", "").strip()
-            write_settings({"app_name": app_name})
-            if app_name:
-                app_message = "Название приложения обновлено."
-                logger.info(f"✅ Название приложения обновлено: {app_name}")
-            else:
-                app_message = "Название приложения убрано."
-                logger.info("ℹ️ Название приложения сброшено")
-        
-        elif form_type == "ip_settings":
             hide_ovpn_ip = request.form.get("hide_ovpn_ip") == "on"
             hide_wg_ip = request.form.get("hide_wg_ip") == "on"
-            write_settings({"hide_ovpn_ip": hide_ovpn_ip, "hide_wg_ip": hide_wg_ip})
-            ip_message = "Настройки отображения IP сохранены."
-            logger.info(f"✅ Настройки IP обновлены: OVPN={hide_ovpn_ip}, WG={hide_wg_ip}")
-    
+            retention_days = parse_stats_retention_days(
+                request.form.get("stats_retention_days", "365")
+            )
+            write_settings(
+                {
+                    "app_name": app_name,
+                    "hide_ovpn_ip": hide_ovpn_ip,
+                    "hide_wg_ip": hide_wg_ip,
+                    "stats_retention_days": retention_days,
+                }
+            )
+            settings_message = "Настройки сохранены."
+
+        elif form_type == "stats_db_clear_ovpn":
+            phrase = (request.form.get("confirm_phrase") or "").strip()
+            if phrase != STATS_DB_CLEAR_OVPN_PHRASE:
+                stats_db_error = "Неверная фраза. Введите: OpenVPN"
+            else:
+                ok, err = clear_openvpn_stats_database()
+                if ok:
+                    stats_db_message = "База статистики OpenVPN очищена."
+                    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+                    if client_ip and "," in client_ip:
+                        client_ip = client_ip.split(",")[0].strip()
+                    log_action(
+                        "web",
+                        current_user.username,
+                        current_user.username,
+                        "stats_db_clear_ovpn",
+                        "",
+                        client_ip or "",
+                    )
+                else:
+                    stats_db_error = f"Ошибка очистки OpenVPN: {err}"
+
+        elif form_type == "stats_db_clear_wg":
+            phrase = (request.form.get("confirm_phrase") or "").strip()
+            if phrase != STATS_DB_CLEAR_WG_PHRASE:
+                stats_db_error = "Неверная фраза. Введите: WireGuard"
+            else:
+                ok, err = clear_wireguard_stats_database()
+                if ok:
+                    stats_db_message = "База статистики WireGuard очищена."
+                    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+                    if client_ip and "," in client_ip:
+                        client_ip = client_ip.split(",")[0].strip()
+                    log_action(
+                        "web",
+                        current_user.username,
+                        current_user.username,
+                        "stats_db_clear_wg",
+                        "",
+                        client_ip or "",
+                    )
+                else:
+                    stats_db_error = f"Ошибка очистки WireGuard: {err}"
+
     settings_data = read_settings()
-    current_app_name = settings_data.get("app_name", "OpenVPN-Status")
+    current_app_name = settings_data.get("app_name", "StatusOpenVPN")
     hide_ovpn_ip = settings_data.get("hide_ovpn_ip", True)
     hide_wg_ip = settings_data.get("hide_wg_ip", True)
-    
-    logger.debug(f"📄 Запрошена страница настроек пользователем {current_user.username}")
+    stats_retention_days = parse_stats_retention_days(
+        settings_data.get("stats_retention_days", 365)
+    )
+
+    stats_db_items, stats_db_total_bytes = get_ovpn_wg_database_sizes()
+
     return render_template(
         "settings/settings.html",
         app_name=current_app_name,
         hide_ovpn_ip=hide_ovpn_ip,
         hide_wg_ip=hide_wg_ip,
-        app_message=app_message,
-        app_error=app_error,
-        ip_message=ip_message,
+        settings_message=settings_message,
+        settings_error=settings_error,
+        stats_retention_days=stats_retention_days,
+        stats_db_items=stats_db_items,
+        stats_db_total_fmt=format_bytes(stats_db_total_bytes),
+        stats_db_message=stats_db_message,
+        stats_db_error=stats_db_error,
+        stats_clear_ovpn_phrase=STATS_DB_CLEAR_OVPN_PHRASE,
+        stats_clear_wg_phrase=STATS_DB_CLEAR_WG_PHRASE,
         active_page="settings",
     )
 
@@ -2290,6 +2496,14 @@ def wg():
     logger.debug(f"📄 Запрошена страница WireGuard пользователем {current_user.username}")
     return render_template("wg/wg.html", stats=stats, active_section="wg", active_page="wg_clients")
 
+
+@app.route("/wg/client-status")
+@login_required
+def wg_client_status():
+    """Старая страница статуса объединена с разделом «Клиенты»."""
+    return redirect(url_for("wg"))
+
+
 @app.route("/api/wg/stats")
 @login_required
 def api_wg_stats():
@@ -2367,53 +2581,366 @@ def toggle_wg_peer():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/wg/stats")
+@login_required
+def wg_stats():
+    try:
+        sort_by = request.args.get("sort", "client")
+        order = request.args.get("order", "asc").lower()
+        period = request.args.get("period", "month")
+        now = datetime.now()
+        selected_date_from = (request.args.get("date_from") or "").strip()
+        selected_date_to = (request.args.get("date_to") or "").strip()
+
+        allowed_sorts = {
+            "client": "client",
+            "total_sent": "SUM(sent)",
+            "total_received": "SUM(received)",
+        }
+
+        sort_column = allowed_sorts.get(sort_by, "client")
+        order_sql = "DESC" if order == "desc" else "ASC"
+        if period == "day":
+            date_from = now.strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"за {now.strftime('%d.%m.%Y')}"
+        elif period == "week":
+            week_start = now - timedelta(days=7)
+            date_from = week_start.strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"с {week_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+        elif period == "year":
+            year_start = now - timedelta(days=365)
+            date_from = year_start.strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"с {year_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+        elif period == "custom":
+            date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
+            date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
+            if date_from_dt and date_to_dt:
+                if date_from_dt > date_to_dt:
+                    date_from_dt, date_to_dt = date_to_dt, date_from_dt
+                selected_date_from = date_from_dt.strftime("%Y-%m-%d")
+                selected_date_to = date_to_dt.strftime("%Y-%m-%d")
+                date_from = selected_date_from
+                date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+                interval_label = f"с {date_from_dt.strftime('%d.%m.%Y')} по {date_to_dt.strftime('%d.%m.%Y')}"
+            else:
+                period = "month"
+                date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+                date_to = None
+                interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+        else:
+            period = "month"
+            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+
+        stats_list = []
+        total_received, total_sent = 0, 0
+
+        with sqlite3.connect(app.config["WG_STATS_PATH"]) as conn:
+            if date_to:
+                query = f"""
+                    SELECT client,
+                           SUM(received) as total_received,
+                           SUM(sent) as total_sent
+                    FROM wg_daily_stats
+                    WHERE date >= ? AND date < ?
+                    GROUP BY client
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (date_from, date_to)).fetchall()
+            else:
+                query = f"""
+                    SELECT client,
+                           SUM(received) as total_received,
+                           SUM(sent) as total_sent
+                    FROM wg_daily_stats
+                    WHERE date >= ?
+                    GROUP BY client
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (date_from,)).fetchall()
+
+            for row in rows:
+                client, received, sent = row
+                received = received or 0
+                sent = sent or 0
+                total_received += received
+                total_sent += sent
+                stats_list.append(
+                    {
+                        "client": client,
+                        "total_received": format_bytes(received),
+                        "total_sent": format_bytes(sent),
+                    }
+                )
+
+        return render_template(
+            "wg/wg_stats.html",
+            total_received=format_bytes(total_received),
+            total_sent=format_bytes(total_sent),
+            active_section="wg",
+            active_page="wg_stats",
+            stats=stats_list,
+            period=period,
+            sort_by=sort_by,
+            order=order_sql.lower(),
+            selected_date_from=selected_date_from,
+            selected_date_to=selected_date_to,
+            interval_label=interval_label,
+        )
+
+    except Exception as e:
+        error_message = f"Произошла непредвиденная ошибка: {e}"
+        return render_template(
+            "wg/wg_stats.html",
+            error_message=error_message,
+            active_section="wg",
+            active_page="wg_stats",
+        ), 500
+
+
+def _collect_openvpn_clients_unsorted():
+    """Собирает список клиентов OpenVPN без сортировки.
+    Возвращает (all_clients_list, total_received, total_sent, errors)."""
+    file_paths = LOG_FILES
+
+    online_clients_raw = []
+    total_received, total_sent = 0, 0
+    errors = []
+    online_client_names = set()
+
+    for file_path, protocol in file_paths:
+        file_data, received, sent, error = read_csv(file_path, protocol)
+        if error:
+            errors.append(f"Ошибка в файле {file_path}: {error}")
+        else:
+            online_clients_raw.extend(file_data)
+            total_received += received
+            total_sent += sent
+            for client_row in file_data:
+                if client_row[0] != "UNDEF":
+                    online_client_names.add(client_row[0])
+
+    all_clients = get_all_openvpn_clients()
+    server_ip = get_external_ip()
+
+    all_clients_list = []
+
+    for client_row in online_clients_raw:
+        client_name = client_row[0]
+        if client_name == "UNDEF":
+            continue
+        all_clients_list.append(
+            {
+                "name": client_name,
+#                "display_name": clean_client_display_name(client_name, server_ip),
+                "online": True,
+                "real_ip": client_row[1],
+                "local_ip": client_row[2],
+                "received": client_row[3],
+                "sent": client_row[4],
+                "download_speed": client_row[5],
+                "upload_speed": client_row[6],
+                "connected_since": client_row[7],
+                "duration": client_row[8],
+                "protocol": client_row[9],
+            }
+        )
+
+    for client_name in sorted(all_clients):
+        if client_name not in online_client_names:
+            all_clients_list.append(
+                {
+                    "name": client_name,
+#                    "display_name": clean_client_display_name(
+#                        client_name, server_ip
+#                    ),
+                    "online": False,
+                    "real_ip": "-",
+                    "local_ip": "-",
+                    "received": "-",
+                    "sent": "-",
+                    "download_speed": "-",
+                    "upload_speed": "-",
+                    "connected_since": "-",
+                    "duration": "-",
+                    "protocol": "-",
+                }
+            )
+
+    return all_clients_list, total_received, total_sent, errors
+
+
+def get_all_openvpn_clients():
+    if not os.path.exists(CLIENT_SH_PATH):
+        clients = set()
+        for base_dir in OPENVPN_CONFIG_PATHS:
+            if not os.path.exists(base_dir):
+                continue
+            for root, _, files in os.walk(base_dir):
+                for filename in files:
+                    if not filename.endswith(".ovpn"):
+                        continue
+                    client_name = _extract_client_name_from_ovpn(filename)
+                    if client_name:
+                        clients.add(client_name)
+        return clients
+
+    try:
+        env = os.environ.copy()
+        env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        proc = subprocess.run(
+            [CLIENT_SH_PATH, "3"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+    except Exception:
+        return set()
+
+    if proc.returncode != 0:
+        return set()
+
+    clients = set()
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("OpenVPN client names:") or line.startswith(
+            "OpenVPN - List clients"
+        ):
+            continue
+        clients.add(line)
+    return clients
+
+
+def _dedupe_openvpn_client_status_rows(rows):
+    """Одна строка на уникальное имя клиента."""
+    groups = OrderedDict()
+    for row in rows:
+        name = row["name"]
+        if name not in groups:
+            groups[name] = []
+        groups[name].append(row)
+
+    out = []
+    for grp in groups.values():
+        if len(grp) == 1:
+            out.append(grp[0])
+            continue
+        merged = dict(grp[0])
+        merged["online"] = any(r["online"] for r in grp)
+        merged["blocked"] = any(r["blocked"] for r in grp)
+        online_protocols = [
+            r["protocol"]
+            for r in grp
+            if r["online"] and r.get("protocol") not in (None, "-", "")
+        ]
+        if len(online_protocols) > 1:
+            merged["protocol"] = ""
+        elif len(online_protocols) == 1:
+            merged["protocol"] = online_protocols[0]
+        else:
+            merged["protocol"] = grp[0]["protocol"]
+        out.append(merged)
+    return out
+
+
+def _build_openvpn_clients_sorted(sort_by, order):
+    """Собирает список клиентов OpenVPN и сортирует. Возвращает
+    (all_clients_list, total_received, total_sent, errors, total_online)."""
+    all_clients_list, total_received, total_sent, errors = (
+        _collect_openvpn_clients_unsorted()
+    )
+
+    reverse_order = order == "desc"
+
+    def sort_key(x):
+        online_priority = 0 if x["online"] else 1
+        if sort_by == "client":
+            return (online_priority, x["name"].lower())
+        elif sort_by == "realIp":
+            return (online_priority, x["real_ip"])
+        elif sort_by == "localIp":
+            return (online_priority, x["local_ip"])
+        elif sort_by == "sent":
+            return (
+                online_priority,
+                parse_bytes(x["sent"]) if x["sent"] != "-" else -1,
+            )
+        elif sort_by == "received":
+            return (
+                online_priority,
+                parse_bytes(x["received"]) if x["received"] != "-" else -1,
+            )
+        elif sort_by == "connection-time":
+            return (
+                online_priority,
+                x["connected_since"] if x["connected_since"] != "-" else "",
+            )
+        elif sort_by == "duration":
+            return (
+                online_priority,
+                x["connected_since"] if x["connected_since"] != "-" else "",
+            )
+        elif sort_by == "protocol":
+            return (online_priority, x["protocol"])
+        elif sort_by == "status":
+            return (0 if x["online"] else 1, 0 if not x["blocked"] else 1)
+        return (online_priority, x["name"].lower())
+
+    all_clients_list.sort(key=sort_key, reverse=reverse_order)
+
+    total_online = len([c for c in all_clients_list if c["online"]])
+    for c in all_clients_list:
+        c["row_key"] = _ovpn_session_row_key(c["name"], c["protocol"])
+    return all_clients_list, total_received, total_sent, errors, total_online
+
+
+@app.route("/api/ovpn/clients")
+@login_required
+def api_ovpn_clients():
+    """JSON-снимок списка OpenVPN для частичного обновления страницы /ovpn."""
+    sort_by = request.args.get("sort", "client")
+    order = request.args.get("order", "asc")
+    try:
+        all_clients_list, total_received, total_sent, errors, total_online = (
+            _build_openvpn_clients_sorted(sort_by, order)
+        )
+        online = [c for c in all_clients_list if c["online"]]
+        return jsonify(
+            {
+                "ok": True,
+                "online": online,
+                "total_received": format_bytes(total_received),
+                "total_sent": format_bytes(total_sent),
+                "total_clients_str": pluralize_clients(total_online),
+                "total_online": total_online,
+                "errors": errors,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/ovpn")
 @login_required
 def ovpn():
     try:
-        # Пути к файлам и протоколы
-        clients = []
-        total_received, total_sent = 0, 0
-        errors = []
-        for file_path, protocol in LOG_FILES:
-            file_data, received, sent, error = read_csv(file_path, protocol)
-            if error:
-                errors.append(f"Ошибка в файле {file_path}: {error}")
-                logger.warning(f"⚠️ {errors[-1]}")
-            else:
-                clients.extend(file_data)
-                total_received += received
-                total_sent += sent
-
-        # Сортировка данных
         sort_by = request.args.get("sort", "client")
         order = request.args.get("order", "asc")
-        reverse_order = order == "desc"
-
-        if sort_by == "client":
-            clients.sort(key=lambda x: x[0], reverse=reverse_order)
-        elif sort_by == "realIp":
-            clients.sort(key=lambda x: x[1], reverse=reverse_order)
-        elif sort_by == "localIp":
-            clients.sort(key=lambda x: x[2], reverse=reverse_order)
-        elif sort_by == "sent":
-            clients.sort(key=lambda x: parse_bytes(x[3]), reverse=reverse_order)
-        elif sort_by == "received":
-            clients.sort(key=lambda x: parse_bytes(x[4]), reverse=reverse_order)
-        elif sort_by == "connection-time":
-            clients.sort(key=lambda x: x[7], reverse=reverse_order)
-        elif sort_by == "duration":
-            clients.sort(key=lambda x: x[7], reverse=reverse_order)
-        elif sort_by == "protocol":
-            clients.sort(key=lambda x: x[9], reverse=reverse_order)
-
-        total_clients = len(clients)
-        hide_ovpn_ip = read_settings().get("hide_ovpn_ip", True)
-        logger.debug(f"📄 Запрошена страница OpenVPN ({total_clients} клиентов)")
+        all_clients_list, total_received, total_sent, errors, total_online = (
+            _build_openvpn_clients_sorted(sort_by, order)
+        )
         return render_template(
             "ovpn/ovpn.html",
-            clients=clients,
-            total_clients_str=pluralize_clients(total_clients),
+            clients=all_clients_list,
+            total_clients_str=pluralize_clients(total_online),
             total_received=format_bytes(total_received),
             total_sent=format_bytes(total_sent),
             active_section="ovpn",
@@ -2421,7 +2948,6 @@ def ovpn():
             errors=errors,
             sort_by=sort_by,
             order=order,
-            hide_ip=hide_ovpn_ip,
         )
 
     except ZoneInfoNotFoundError:
@@ -2431,13 +2957,21 @@ def ovpn():
             "Попробуйте установить правильный часовой пояс "
             "с помощью команды: sudo dpkg-reconfigure tzdata"
         )
-        logger.error(f"❌ Ошибка часового пояса: {error_message}")
-        return render_template("ovpn/ovpn.html", error_message=error_message), 500
+        return render_template(
+            "ovpn/ovpn.html",
+            error_message=error_message,
+            active_section="ovpn",
+            active_page="clients",
+        ), 500
 
     except Exception as e:
         error_message = f"Произошла непредвиденная ошибка: {str(e)}"
-        logger.error(f"❌ Ошибка на странице OpenVPN: {e}")
-        return render_template("ovpn/ovpn.html", error_message=error_message), 500
+        return render_template(
+            "ovpn/ovpn.html",
+            error_message=error_message,
+            active_section="ovpn",
+            active_page="clients",
+        ), 500
 
 
 @app.route("/ovpn/history")
@@ -2498,6 +3032,7 @@ def ovpn_history():
         logger.error(f"❌ Ошибка на странице истории OpenVPN: {e}")
         return render_template("ovpn/ovpn_history.html", error_message=error_message), 500
 
+
 @app.route("/ovpn/stats")
 @login_required
 def ovpn_stats():
@@ -2505,123 +3040,83 @@ def ovpn_stats():
         sort_by = request.args.get("sort", "client_name")
         order = request.args.get("order", "asc").lower()
         period = request.args.get("period", "month")
-        target_date = request.args.get("date")
-        
-        # ✅ ОТЛАДКА: Логируем параметры
-        logger.debug(f"📊 Параметры запроса: period={period}, target_date={target_date}")
-        
-        # Разрешённые поля сортировки (ключ -> SQL)
+        now = datetime.now()
+        selected_date_from = (request.args.get("date_from") or "").strip()
+        selected_date_to = (request.args.get("date_to") or "").strip()
+
         allowed_sorts = {
             "client_name": "client_name",
-            "total_bytes_sent": "SUM(total_bytes_sent)",
-            "total_bytes_received": "SUM(total_bytes_received)",
+            "total_bytes_sent": "SUM(total_bytes_received)",
+            "total_bytes_received": "SUM(total_bytes_sent)",
             "last_connected": "MAX(last_connected)",
         }
+
         sort_column = allowed_sorts.get(sort_by, "client_name")
         order_sql = "DESC" if order == "desc" else "ASC"
-
-        now = datetime.now()
-        date_from = None
-        date_to = None
-
-        # ✅ ЛОГИКА ФИЛЬТРАЦИИ ДАТ
         if period == "day":
-            if target_date:
-                try:
-                    date_obj = datetime.strptime(target_date, "%Y-%m-%d")
-                    date_from = date_obj.strftime("%Y-%m-%d")
-                    date_to = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
-                except ValueError:
-                    date_from = now.strftime("%Y-%m-%d")
-                    date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-            else:
-                date_from = now.strftime("%Y-%m-%d")
-                date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-                
-        elif period == "month":
-            # ✅ Для месяца: от 1 числа до 1 числа следующего месяца
-            if target_date:
-                try:
-                    # Пробуем распарсить как YYYY-MM
-                    date_obj = datetime.strptime(target_date, "%Y-%m")
-                    date_from = date_obj.strftime("%Y-%m-01")
-                    # Первое число следующего месяца
-                    if date_obj.month == 12:
-                        date_to = f"{date_obj.year + 1}-01-01"
-                    else:
-                        date_to = f"{date_obj.year}-{date_obj.month + 1:02d}-01"
-                except ValueError:
-                    # Если не получилось, используем текущий месяц
-                    date_from = now.replace(day=1).strftime("%Y-%m-%d")
-                    if now.month == 12:
-                        date_to = f"{now.year + 1}-01-01"
-                    else:
-                        date_to = f"{now.year}-{now.month + 1:02d}-01"
-            else:
-                date_from = now.replace(day=1).strftime("%Y-%m-%d")
-                if now.month == 12:
-                    date_to = f"{now.year + 1}-01-01"
-                else:
-                    date_to = f"{now.year}-{now.month + 1:02d}-01"
-                    
+            date_from = now.strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"за {now.strftime('%d.%m.%Y')}"
+        elif period == "week":
+            week_start = now - timedelta(days=7)
+            date_from = week_start.strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"с {week_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
         elif period == "year":
-            if target_date:
-                try:
-                    year = int(target_date)
-                    date_from = f"{year}-01-01"
-                    date_to = f"{year + 1}-01-01"
-                except ValueError:
-                    date_from = now.replace(month=1, day=1).strftime("%Y-%m-%d")
-                    date_to = (now.replace(year=now.year + 1, month=1, day=1)).strftime("%Y-%m-%d")
+            year_start = now - timedelta(days=365)
+            date_from = year_start.strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"с {year_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+        elif period == "custom":
+            date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
+            date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
+            if date_from_dt and date_to_dt:
+                if date_from_dt > date_to_dt:
+                    date_from_dt, date_to_dt = date_to_dt, date_from_dt
+                selected_date_from = date_from_dt.strftime("%Y-%m-%d")
+                selected_date_to = date_to_dt.strftime("%Y-%m-%d")
+                date_from = selected_date_from
+                date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+                interval_label = f"с {date_from_dt.strftime('%d.%m.%Y')} по {date_to_dt.strftime('%d.%m.%Y')}"
             else:
-                date_from = now.replace(month=1, day=1).strftime("%Y-%m-%d")
-                date_to = (now.replace(year=now.year + 1, month=1, day=1)).strftime("%Y-%m-%d")
+                period = "month"
+                date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+                date_to = None
+                interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
         else:
             period = "month"
-            date_from = now.replace(day=1).strftime("%Y-%m-%d")
-            if now.month == 12:
-                date_to = f"{now.year + 1}-01-01"
-            else:
-                date_to = f"{now.year}-{now.month + 1:02d}-01"
-
-        # ✅ ОТЛАДКА: Логируем даты
-        logger.debug(f"📊 Диапазон дат: date_from={date_from}, date_to={date_to}")
+            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            date_to = None
+            interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
 
         stats_list = []
         total_received, total_sent = 0, 0
 
         with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-            # ✅ Для периода "day" используем daily_stats, для остальных monthly_stats
-            if period == "day":
+            if date_to:
                 query = f"""
                     SELECT client_name,
-                           SUM(total_bytes_sent) as sent,
-                           SUM(total_bytes_received) as received,
-                           MAX(last_connected)
-                    FROM daily_stats
-                    WHERE hour >= ? AND hour < ?
-                    GROUP BY client_name
-                    HAVING (SUM(total_bytes_sent) > 0 OR SUM(total_bytes_received) > 0)
-                    ORDER BY {sort_column} {order_sql}
-                """
-                rows = conn.execute(query, (date_from, date_to)).fetchall()
-            else:
-                # ✅ ИСПРАВЛЕНО: Используем strftime для сравнения по месяцу
-                query = f"""
-                    SELECT client_name,
-                           SUM(total_bytes_sent) as sent,
-                           SUM(total_bytes_received) as received,
+                           SUM(total_bytes_sent),
+                           SUM(total_bytes_received),
                            MAX(last_connected)
                     FROM monthly_stats
                     WHERE month >= ? AND month < ?
                     GROUP BY client_name
-                    HAVING (SUM(total_bytes_sent) > 0 OR SUM(total_bytes_received) > 0)
                     ORDER BY {sort_column} {order_sql}
                 """
                 rows = conn.execute(query, (date_from, date_to)).fetchall()
-            
-            # ✅ ОТЛАДКА: Логируем количество записей
-            logger.debug(f"📊 Найдено записей: {len(rows)}")
+            else:
+                query = f"""
+                    SELECT client_name,
+                           SUM(total_bytes_sent),
+                           SUM(total_bytes_received),
+                           MAX(last_connected)
+                    FROM monthly_stats
+                    WHERE month >= ?
+                    GROUP BY client_name
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (date_from,)).fetchall()
 
             for client_name, sent, received, last_connected in rows:
                 total_received += received or 0
@@ -2629,13 +3124,12 @@ def ovpn_stats():
                 stats_list.append(
                     {
                         "client_name": client_name,
-                        "total_bytes_sent": format_bytes(sent),
-                        "total_bytes_received": format_bytes(received),
+                        "total_bytes_sent": format_bytes(received),
+                        "total_bytes_received": format_bytes(sent),
                         "last_connected": last_connected,
                     }
                 )
 
-        logger.debug(f"📄 Запрошена статистика OpenVPN за {date_from} - {date_to} (активных клиентов: {len(stats_list)})")
         return render_template(
             "ovpn/ovpn_stats.html",
             total_received=format_bytes(total_received),
@@ -2646,13 +3140,19 @@ def ovpn_stats():
             period=period,
             sort_by=sort_by,
             order=order_sql.lower(),
-            target_date=target_date,
+            selected_date_from=selected_date_from,
+            selected_date_to=selected_date_to,
+            interval_label=interval_label,
         )
 
     except Exception as e:
         error_message = f"Произошла непредвиденная ошибка: {e}"
-        logger.error(f"❌ Ошибка на странице статистики OpenVPN: {e}")
-        return render_template("ovpn/ovpn_stats.html", error_message=error_message), 500
+        return render_template(
+            "ovpn/ovpn_stats.html",
+            error_message=error_message,
+            active_section="ovpn",
+            active_page="stats",
+        ), 500
 
 
 @app.route("/api/ovpn/client_chart")
@@ -2660,219 +3160,81 @@ def ovpn_stats():
 def api_ovpn_client_chart():
     client_name = request.args.get("client")
     period = request.args.get("period", "month")
-    target_date = request.args.get("date")
-    
+    now = datetime.now()
+    selected_date_from = (request.args.get("date_from") or "").strip()
+    selected_date_to = (request.args.get("date_to") or "").strip()
     if not client_name:
         return jsonify({"error": "client parameter required"}), 400
-    
-    now = datetime.now()
-    date_from = None
-    date_to = None
-    
-    # Логика дат для графика
+
     if period == "day":
-        if target_date:
-            try:
-                date_obj = datetime.strptime(target_date, "%Y-%m-%d")
-                date_from = date_obj.strftime("%Y-%m-%d")
-                date_to = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
-            except ValueError:
-                date_from = now.strftime("%Y-%m-%d")
-                date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        else:
-            date_from = now.strftime("%Y-%m-%d")
-            date_to = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        try:
-            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-                rows = conn.execute(
-                    """SELECT hour,
-                          SUM(total_bytes_received) as rx,
-                          SUM(total_bytes_sent) as tx,
-                          SUM(total_connections) as connections,
-                          MAX(last_connected) as last_conn
-                   FROM daily_stats
-                   WHERE client_name = ? AND hour >= ? AND hour < ?
-                   GROUP BY hour
-                   ORDER BY hour ASC""",
-                    (client_name, date_from, date_to),
-                ).fetchall()
-                
-                labels = []
-                rx_data = []
-                tx_data = []
-                
-                for hour_val, rx, tx, conn_count, last_conn in rows:
-                    if hour_val and 'T' in hour_val and not hour_val.endswith('Z'):
-                        labels.append(hour_val + 'Z')
-                    else:
-                        labels.append(hour_val)
-                    rx_data.append(rx or 0)
-                    tx_data.append(tx or 0)
-                
-                logger.debug(f"📊 График трафика OpenVPN клиента {client_name} (день: {date_from})")
-                return jsonify({
-                    "client": client_name,
-                    "labels": labels,
-                    "rx_bytes": rx_data,
-                    "tx_bytes": tx_data
-                })
-        except Exception as e:
-            logger.error(f"❌ Ошибка графика OpenVPN (day): {e}")
-            return jsonify({
-                "client": client_name,
-                "labels": [],
-                "rx_bytes": [],
-                "tx_bytes": []
-            })
-    
+        date_from = now.strftime("%Y-%m-%d")
+        date_to = None
+    elif period == "week":
+        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        date_to = None
     elif period == "year":
-        if target_date:
-            try:
-                year = int(target_date)
-                target_year_str = f"{year}"
-            except ValueError:
-                target_year_str = str(now.year)
+        date_from = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+        date_to = None
+    elif period == "custom":
+        date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
+        date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
+        if date_from_dt and date_to_dt:
+            if date_from_dt > date_to_dt:
+                date_from_dt, date_to_dt = date_to_dt, date_from_dt
+            date_from = date_from_dt.strftime("%Y-%m-%d")
+            date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
-            target_year_str = str(now.year)
-        
-        try:
-            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-                rows = conn.execute(
-                    """SELECT month,
-                          SUM(total_bytes_received) as rx,
-                          SUM(total_bytes_sent) as tx
-                   FROM years_stats
-                   WHERE client_name = ? AND SUBSTR(month, 1, 4) = ?
-                   GROUP BY month
-                   ORDER BY month ASC""",
-                    (client_name, target_year_str),
-                ).fetchall()
-            
-            labels = []
-            rx_data = []
-            tx_data = []
-            
-            for month_val, rx, tx in rows:
-                try:
-                    dt = datetime.strptime(month_val, "%Y-%m")
-                    labels.append(dt.strftime("%b %Y"))
-                except:
-                    labels.append(month_val)
-                rx_data.append(rx or 0)
-                tx_data.append(tx or 0)
-            
-            return jsonify({
-                "client": client_name,
-                "labels": labels,
-                "rx_bytes": rx_data,
-                "tx_bytes": tx_data
-            })
-        except Exception as e:
-            logger.error(f"❌ Ошибка графика OpenVPN (year): {e}")
-            return jsonify({
-                "client": client_name,
-                "labels": [],
-                "rx_bytes": [],
-                "tx_bytes": []
-            })
-    
-    elif period == "month":
-        if target_date:
-            try:
-                date_obj = datetime.strptime(target_date, "%Y-%m")
-                date_from = date_obj.strftime("%Y-%m-01")
-                if date_obj.month == 12:
-                    date_to = f"{date_obj.year + 1}-01-01"
-                else:
-                    date_to = f"{date_obj.year}-{date_obj.month + 1:02d}-01"
-            except ValueError:
-                date_from = now.replace(day=1).strftime("%Y-%m-%d")
-                date_to = (now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
-        else:
-            date_from = now.replace(day=1).strftime("%Y-%m-%d")
-            date_to = (now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
-        
-        try:
-            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-                rows = conn.execute(
-                    """SELECT strftime('%Y-%m-%d', hour) as day_label,
-                          SUM(total_bytes_received) as rx,
-                          SUM(total_bytes_sent) as tx
-                   FROM daily_stats
-                   WHERE client_name = ? AND hour >= ? AND hour < ?
-                   GROUP BY day_label
-                   ORDER BY day_label ASC""",
-                    (client_name, date_from, date_to),
-                ).fetchall()
-            
-            labels = []
-            rx_data = []
-            tx_data = []
-            
-            for day_label, rx, tx in rows:
-                try:
-                    day_obj = datetime.strptime(day_label, "%Y-%m-%d")
-                    labels.append(day_obj.strftime("%d.%m"))
-                except:
-                    labels.append(day_label)
-                rx_data.append(rx or 0)
-                tx_data.append(tx or 0)
-            
-            return jsonify({
-                "client": client_name,
-                "labels": labels,
-                "rx_bytes": rx_data,
-                "tx_bytes": tx_data
-            })
-        except Exception as e:
-            logger.error(f"❌ Ошибка графика OpenVPN (month): {e}")
-            return jsonify({
-                "client": client_name,
-                "labels": [],
-                "rx_bytes": [],
-                "tx_bytes": []
-            })
-    
+            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            date_to = None
     else:
-        date_from = now.replace(day=1).strftime("%Y-%m-%d")
-        date_to = (now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
-        
-        try:
-            with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
+        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        date_to = None
+
+    try:
+        with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
+            if date_to:
                 rows = conn.execute(
-                    """SELECT strftime('%Y-%m-%d', hour) as day_label,
-                          SUM(total_bytes_received) as rx,
-                          SUM(total_bytes_sent) as tx
-                   FROM daily_stats
-                   WHERE client_name = ? AND hour >= ? AND hour < ?
-                   GROUP BY day_label
-                   ORDER BY day_label ASC""",
+                    """
+                    SELECT month,
+                           SUM(total_bytes_received) as rx,
+                           SUM(total_bytes_sent) as tx
+                    FROM monthly_stats
+                    WHERE client_name = ? AND month >= ? AND month < ?
+                    GROUP BY month
+                    ORDER BY month ASC
+                    """,
                     (client_name, date_from, date_to),
                 ).fetchall()
-            
-            labels = []
-            rx_data = []
-            tx_data = []
-            
-            for day_label, rx, tx in rows:
-                try:
-                    day_obj = datetime.strptime(day_label, "%Y-%m-%d")
-                    labels.append(day_obj.strftime("%d.%m"))
-                except:
-                    labels.append(day_label)
-                rx_data.append(rx or 0)
-                tx_data.append(tx or 0)
-            
-            return jsonify({
-                "client": client_name,
-                "labels": labels,
-                "rx_bytes": rx_data,
-                "tx_bytes": tx_data
-            })
-        except Exception as e:
-            logger.error(f"❌ Ошибка графика OpenVPN: {e}")
-            return jsonify({"error": str(e)}), 500
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT month,
+                           SUM(total_bytes_received) as rx,
+                           SUM(total_bytes_sent) as tx
+                    FROM monthly_stats
+                    WHERE client_name = ? AND month >= ?
+                    GROUP BY month
+                    ORDER BY month ASC
+                    """,
+                    (client_name, date_from),
+                ).fetchall()
+
+        labels = []
+        rx_data = []
+        tx_data = []
+        for month_val, rx, tx in rows:
+            labels.append(month_val)
+            rx_data.append(rx or 0)
+            tx_data.append(tx or 0)
+
+        return jsonify({
+            "client": client_name,
+            "labels": labels,
+            "rx_bytes": rx_data,
+            "tx_bytes": tx_data,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/wg/client_chart")
@@ -3301,9 +3663,9 @@ def api_ovpn_speed_stats():
             return jsonify({"labels": [], "rx_speed": [], "tx_speed": []}), 500
 
 
-@app.route("/api/ovpn/clients")
+@app.route("/api/ovpn/chart/clients")
 @login_required
-def api_ovpn_clients():
+def api_ovpn_chart_clients():
     """Возвращает список активных клиентов OpenVPN"""
     try:
         clients = set()

@@ -439,8 +439,12 @@ async def handle_days(message: types.Message, state: FSMContext):
     if result["returncode"] == 0:
         await send_config(message.chat.id, client_name, "1")
         logger.info(f"Клиент OpenVPN создан: {client_name}, срок: {days} дней")
-        await message.answer(f"✅ Клиент создан!\n📅 Срок действия: {format_days(int(days))}")
-        await message.answer("Главное меню:", reply_markup=create_main_menu())
+        server_ip = _get_server_ip()
+        await message.answer(
+            f"✅ Клиент создан!\n📅 Срок действия: {format_days(int(days))}",
+            reply_markup=create_main_menu(server_ip)
+        )
+#        await message.answer("Главное меню:", reply_markup=create_main_menu(server_ip))
     else:
         logger.error(f"Ошибка создания клиента OpenVPN: {result['stderr']}")
         await message.answer(f"❌ Ошибка: {result['stderr']}")

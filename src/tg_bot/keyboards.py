@@ -139,7 +139,6 @@ def create_openvpn_config_menu(client_name: str, back_callback: str = "back_to_c
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-#                InlineKeyboardButton(text="VPN", callback_data=f"openvpn_config_vpn_{client_name}"),
                 InlineKeyboardButton(text="Antizapret", callback_data=f"openvpn_config_antizapret_{client_name}"),
             ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)],
@@ -158,7 +157,6 @@ def create_openvpn_protocol_menu(interface: str, client_name: str):
                 )
             ],
             [
-#                InlineKeyboardButton(text="TCP", callback_data=f"send_ovpn_{interface}_tcp_{client_name}"),
                 InlineKeyboardButton(text="UDP", callback_data=f"send_ovpn_{interface}_udp_{client_name}"),
             ],
             [
@@ -173,7 +171,6 @@ def create_wireguard_config_menu(client_name: str, back_callback: str = "back_to
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-#                InlineKeyboardButton(text="VPN", callback_data=f"wireguard_config_vpn_{client_name}"),
                 InlineKeyboardButton(text="Antizapret", callback_data=f"wireguard_config_antizapret_{client_name}"),
             ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)],
@@ -267,7 +264,6 @@ def create_clients_menu(admin_ids: list):
         buttons.append(
             [InlineKeyboardButton(text="Привязок нет", callback_data="no_action")]
         )
-
     buttons.append([
         InlineKeyboardButton(text="👤 Выбрать пользователя", callback_data="clientmap_select_user")
     ])
@@ -430,7 +426,7 @@ def create_request_access_keyboard():
 
 
 def create_request_actions_keyboard(requester_user_id: int, suggested_name: str = None):
-    """Клавиатура запроса доступа: Выбрать клиента, Ввести имя или Отклонить.
+    """Клавиатура запроса доступа: Выбрать клиента, Ввести имя, Отклонить или Заблокировать.
     suggested_name используется для callback req_pick/req_back (список и «Назад»).
     """
     uid = str(requester_user_id)
@@ -451,6 +447,10 @@ def create_request_actions_keyboard(requester_user_id: int, suggested_name: str 
                 InlineKeyboardButton(
                     text="❌ Отклонить",
                     callback_data=f"req_no_{uid}",
+                ),
+                InlineKeyboardButton(
+                    text="🚫 Заблокировать",
+                    callback_data=f"req_ban_{uid}",
                 ),
             ],
         ]

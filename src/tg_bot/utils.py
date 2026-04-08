@@ -2,7 +2,6 @@
 import os
 import asyncio
 import datetime
-import re
 import logging
 logger = logging.getLogger("tg_bot")
 _server_ip_cache = None

@@ -12,6 +12,7 @@ _settings_mtime = 0
 SETTINGS_PATH = Config.SETTINGS_PATH
 ENV_PATH = Config.ENV_PATH
 CLIENT_MAPPING_KEY = "CLIENT_MAPPING"
+TG_BOT_PROFILE_SEEDED_KEY = "tg_bot_profile_seeded"
 
 ITEMS_PER_PAGE = 5
 DEFAULT_CPU_ALERT_THRESHOLD = 80
@@ -68,6 +69,19 @@ def load_settings():
         _settings_mtime = 0
 
     return data.copy()
+
+
+def is_tg_bot_profile_seeded() -> bool:
+    """Уже выполнялась однократная установка описания и «о боте» через API."""
+    return bool(load_settings().get(TG_BOT_PROFILE_SEEDED_KEY))
+
+
+def mark_tg_bot_profile_seeded() -> None:
+    """Пометить, что описание и «о боте» заданы (чтобы не перезаписывать при каждом запуске)."""
+    data = load_settings()
+    data[TG_BOT_PROFILE_SEEDED_KEY] = True
+    save_settings(data)
+
 
 def save_settings(data):
     """Сохранить настройки в JSON-файл."""
@@ -231,6 +245,20 @@ def set_client_mapping(telegram_id: str, client_name: str):
     serialized = ",".join(serialized_items)
     update_env_values({CLIENT_MAPPING_KEY: serialized})
     logger.info(f"Добавлена привязка клиента: {telegram_id} → {client_name}")
+
+
+def is_user_allowed_for_bot(user_id: int) -> bool:
+    """Можно обрабатывать обновления: админ, привязанный клиент, либо админы ещё не заданы (первичная настройка)."""
+    admin_ids = get_admin_ids()
+    if not admin_ids:
+        return True
+    uid = int(user_id)
+    if uid in admin_ids:
+        return True
+    if get_client_name_for_user(uid):
+        return True
+    return False
+
 
 def remove_client_mapping(telegram_id: str, client_name: str = None):
     """Удаляет привязку клиента."""

@@ -209,14 +209,17 @@ async def request_access_command(message: types.Message):
     keyboard = create_request_actions_keyboard(user.id)
     from ..bot import get_bot
     bot = get_bot()
+    sent = 0
     for admin_id in admin_ids:
         if not is_admin_request_notification_enabled(admin_id):
             continue
         try:
             await bot.send_message(admin_id, text, reply_markup=keyboard)
+            sent += 1
         except Exception:
             pass
-    await message.answer("Запрос отправлен администраторам.")
+    if sent:
+        await message.answer("Запрос отправлен администраторам.")
     logger.info("📩 Запрос доступа от пользователя %s", message.from_user.id)
 
 
@@ -334,7 +337,10 @@ async def handle_request_access(callback: types.CallbackQuery):
         await callback.answer("Запрос отправлен администраторам.")
         logger.info("📩 Запрос доступа отправлен от %s", user.id)
     else:
-        await callback.answer("Не удалось отправить запрос.\nЗапросы временно отключены.", show_alert=True)
+        try:
+            await callback.answer()
+        except Exception:
+            pass
 
 
 @router.callback_query(lambda c: c.data.startswith("user_select_profile_"))

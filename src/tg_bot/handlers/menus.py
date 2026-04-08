@@ -1,10 +1,16 @@
 """Обработчики навигации по меню."""
 
 from aiogram import Router, types
+from typing import Optional, Tuple
 from aiogram.fsm.context import FSMContext
 import logging
 
-from ..config import get_admin_ids, get_client_mapping, remove_client_mapping
+from ..config import (
+    ITEMS_PER_PAGE,
+    get_admin_ids,
+    get_client_mapping,
+    remove_client_mapping,
+)
 from ..admin import (
     is_admin_notification_enabled,
     set_admin_notification,
@@ -27,6 +33,7 @@ from ..keyboards import (
 )
 from ..states import VPNSetup
 from ..utils import get_external_ip
+from ..audit import log_action
 
 logger = logging.getLogger("tg_bot")
 router = Router()
@@ -37,7 +44,7 @@ def _get_server_ip():
 
 
 @router.callback_query(lambda c: c.data in ["main_menu", "openvpn_menu", "wireguard_menu", "server_menu", "clients_menu", "admins_menu"])
-async def handle_main_menus(callback: types.CallbackQuery):
+async def handle_main_menus(callback: types.CallbackQuery, state: FSMContext):
     """Обработка навигации по главному меню."""
     admin_ids = get_admin_ids()
     
@@ -54,9 +61,11 @@ async def handle_main_menus(callback: types.CallbackQuery):
     elif callback.data == "server_menu":
         await callback.message.edit_text("Меню сервера:", reply_markup=create_server_menu())
     elif callback.data == "clients_menu":
+        await state.clear()
         await callback.message.edit_text(
             "Привязки клиентов:\n\n"
-            "Чтобы удалить привязку — нажмите на неё в списке и подтвердите удаление.",
+            "Чтобы удалить привязку — нажмите на неё в списке и подтвердите удаление.\n"
+            "Раздел «Заблокированные» — пользователи, которым бот не отвечает.",
             reply_markup=create_clients_menu(admin_ids),
         )
     elif callback.data == "admins_menu":
@@ -167,7 +176,7 @@ async def handle_clientmap_actions(callback: types.CallbackQuery, state: FSMCont
         await callback.answer()
 
 
-@router.callback_query(lambda c: c.data in ["notifications_menu", "toggle_notifications", "toggle_load_notifications", "toggle_request_notifications"])
+@router.callback_query(lambda c: c.data in ["notifications_menu", "toggle_notifications", "toggle_load_notifications", "toggle_request_notifications", "toggle_vpn_service_notifications"])
 async def handle_notifications_menu(callback: types.CallbackQuery):
     """Обработка меню уведомлений."""
     admin_ids = get_admin_ids()

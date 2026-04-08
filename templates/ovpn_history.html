@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block title %}История{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h2>История подключений OpenVPN</h2>
+</div>
+
+<div class="tabs">
+    <a href="{{ url_for('ovpn') }}" class="tab {% if active_page == 'ovpn' %}active{% endif %}">Клиенты</a>
+    <a href="{{ url_for('ovpn_history') }}" class="tab {% if active_page == 'history' %}active{% endif %}">История</a>
+    <a href="{{ url_for('ovpn_stats') }}" class="tab {% if active_page == 'stats' %}active{% endif %}">Статистика</a>
+</div>
+
+{% if error_message %}
+<div class="alert alert-danger" role="alert">
+    {{ error_message }}
+</div>
+{% else %}
+
+<div class="mb-3">
+    <input type="text" id="logFilter" class="form-control" placeholder="Фильтр по имени клиента, IP адресу или протоколу...">
+</div>
+
+<div class="table-responsive ovpn_table log_table w-100">
+    <table class="table table-hover table-sm align-middle">
+        <thead>
+            <tr>
+                <th class="text-center">Клиент</th>
+                <th class="text-center">Реальный IP</th>
+                <th class="text-center">Локальный IP</th>
+                <th class="text-center">Подключен</th>
+                <th class="text-center">Протокол</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for log in logs %}
+            {% if log['client_name'] != 'UNDEF' %}
+            <tr class="log-row">
+                <td class="text-center client-name">{{ log['client_name'] }}</td>
+                <td class="text-center real-ip">{{ log['real_ip'] }}</td>
+                <td class="text-center local-ip">{{ log['local_ip'] }}</td>
+                <td class="text-center connection-time" data-utc="{{ log['connection_since'] }}">{{
+                    log['connection_since'] }}</td>
+                <td class="text-center protocol">{{ log['protocol'] }}</td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+
+{% endif %}
+
+<script src="{{ url_for('static', filename='js/ovpn_history.js') }}"></script>
+
+
+{% endblock %}

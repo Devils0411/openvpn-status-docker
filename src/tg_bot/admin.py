@@ -120,6 +120,16 @@ def set_admin_request_notification(user_id: int, enabled: bool):
     save_settings(data)
 
 
+def is_any_admin_request_notification_enabled() -> bool:
+    """Включены ли уведомления о запросах хотя бы у одного администратора из ADMIN_ID."""
+    from .config import get_admin_ids
+
+    for aid in get_admin_ids():
+        if is_admin_request_notification_enabled(aid):
+            return True
+    return False
+
+
 def get_user_label(telegram_id: str) -> str:
     """Получить отображаемую подпись для пользователя Telegram."""
     data = load_settings()
