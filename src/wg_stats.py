@@ -1,14 +1,16 @@
-#!/root/web/venv/bin/python
-"""Скрипт сбора и сохранения статистики WireGuard"""
-from datetime import datetime, timedelta
+#!/usr/bin/env python3
+"""Оптимизированный скрипт сбора и сохранения статистики WireGuard (через синхронное Amnezia API)"""
 import os
 import time
-import sqlite3
-import subprocess
 import json
-import schedule
+import sqlite3
 import logging
+import docker
+import requests
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
+import schedule
+from typing import Optional, List, Dict, Tuple
 from config import Config
 
 # =============================================================================
@@ -16,652 +18,447 @@ from config import Config
 # =============================================================================
 LOG_DIR = Config.LOGS_PATH
 os.makedirs(LOG_DIR, exist_ok=True)
-STDOUT_LOG = os.path.join(LOG_DIR, 'wg_stats.stdout.log')
-STDERR_LOG = os.path.join(LOG_DIR, 'wg_stats.stderr.log')
+INFO_LOG = os.path.join(LOG_DIR, 'wg_stats.info.log')
+ERROR_LOG = os.path.join(LOG_DIR, 'wg_stats.error.log')
 MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
 BACKUP_COUNT = 5
 LOG_LEVEL = getattr(Config, 'LOG_LEVEL', logging.INFO)
 
-class LevelFilter(logging.Filter):
-    """Фильтр для разделения логов по уровням"""
-    def __init__(self, min_level, max_level=None):
-        super().__init__()
-        self.min_level = min_level
-        self.max_level = max_level or min_level
-    
-    def filter(self, record):
-        return self.min_level <= record.levelno <= self.max_level
-
-# Очищаем корневой логгер
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
-
-# Настраиваем логгер
 logger = logging.getLogger(__name__)
-logger.setLevel(LOG_LEVEL)
+logger.setLevel(logging.DEBUG)
 logger.propagate = False
 logger.handlers.clear()
-
-# Обработчик для WARNING и выше (stderr)
-stderr_handler = RotatingFileHandler(
-    STDERR_LOG, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT,
-    encoding='utf-8', delay=True
+formatter = logging.Formatter(
+    '%(asctime)s [%(levelname)-8s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-stderr_handler.setLevel(logging.WARNING)
-stderr_handler.addFilter(LevelFilter(logging.WARNING, logging.CRITICAL))
-stderr_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%d-%m-%Y %H:%M:%S'
-))
 
-# Обработчик для DEBUG и INFO (stdout)
-stdout_handler = RotatingFileHandler(
-    STDOUT_LOG, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT,
-    encoding='utf-8', delay=True
-)
-stdout_handler.setLevel(logging.DEBUG)
-stdout_handler.addFilter(LevelFilter(logging.DEBUG, logging.INFO))
-stdout_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%d-%m-%Y %H:%M:%S'
-))
+class LevelRangeFilter(logging.Filter):
+    def __init__(self, min_level: int, max_level: int):
+        super().__init__()
+        self.min_level = min_level
+        self.max_level = max_level
+    def filter(self, record) -> bool:
+        return self.min_level <= record.levelno <= self.max_level
 
-logger.addHandler(stderr_handler)
-#logger.addHandler(stdout_handler)
+info_handler = RotatingFileHandler(INFO_LOG, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT, encoding='utf-8', delay=True)
+info_handler.setLevel(logging.DEBUG)
+info_handler.addFilter(LevelRangeFilter(logging.DEBUG, logging.INFO))
+info_handler.setFormatter(formatter)
+
+error_handler = RotatingFileHandler(ERROR_LOG, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT, encoding='utf-8', delay=True)
+error_handler.setLevel(logging.WARNING)
+error_handler.setFormatter(formatter)
+
+logger.addHandler(error_handler)
+# logger.addHandler(info_handler)  # Оставлено закомментированным как в оригинале
 
 # =============================================================================
-# КОНФИГУРАЦИЯ
+# СИНХРОННЫЙ API КЛИЕНТ И ОБНАРУЖЕНИЕ КОНТЕЙНЕРА
+# =============================================================================
+class AmneziaDiscoverer:
+    """Синхронное обнаружение контейнера AmneziaWG и извлечение учетных данных."""
+    @staticmethod
+    def get_connection_info() -> Optional[Tuple[str, str, str]]:
+        try:
+            client = docker.from_env()
+            for container in client.containers.list():
+                if "amnezia" in container.name.lower():
+                    nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                    ip = next((net.get("IPAddress") for net in nets.values() if net.get("IPAddress")), None)
+                    if not ip:
+                        continue
+
+                    password = None
+                    port = "8080"  # Fallback по умолчанию
+                    for env in container.attrs.get("Config", {}).get("Env", []):
+                        if env.startswith("WIREGUARD_PASSWORD="):
+                            password = env.split("=", 1)[1].strip()
+                        elif env.startswith("PORT="):
+                            port = env.split("=", 1)[1].strip()
+
+                    if ip and password:
+                        logger.debug(f"🔍 Найдено: IP={ip}, PORT={port}")
+                        return ip, password, port
+        except Exception as e:
+            logger.error(f"❌ Ошибка обнаружения контейнера: {e}")
+        return None
+
+class AmneziaApiSyncClient:
+    """Синхронный клиент для взаимодействия с API AmneziaWG Easy."""
+    def __init__(self, base_url: str, password: str):
+        self.base_url = base_url.rstrip("/")
+        self.password = password
+        self.session = requests.Session()
+
+    def login(self) -> None:
+        resp = self.session.post(
+            f"{self.base_url}/api/session",
+            json={"password": self.password, "remember": True},
+            headers={"Content-Type": "application/json"}
+        )
+        resp.raise_for_status()
+        logger.debug("✅ Успешная аутентификация в AmneziaWG Easy")
+
+    def get_clients_stats(self) -> List[Dict]:
+        resp = self.session.get(
+            f"{self.base_url}/api/wireguard/client",
+            headers={"Accept": "application/json"}
+        )
+        resp.raise_for_status()
+        clients = resp.json()
+        stats = []
+        for c in clients:
+            rx = c.get("transferRx") or c.get("transfer_rx", 0)
+            tx = c.get("transferTx") or c.get("transfer_tx", 0)
+            peer_key = c.get("publicKey") or c.get("id", "")
+            client_name = c.get("name", "Unknown")
+
+            stats.append({
+                "peer": peer_key,
+                "client": client_name,
+                "interface": "wg0",
+                "received": str(rx),
+                "sent": str(tx)
+            })
+        return stats
+
+# =============================================================================
+# КОНФИГУРАЦИЯ И КЭШИ
 # =============================================================================
 DB_PATH = Config.WG_STATS_PATH
 SETTINGS_PATH = Config.SETTINGS_PATH
-SAVE_TIME = "23:59"  # Время для фиксирования дневного трафика
-START_TIME = "00:00"  # Время для начала записи нового дня
-EVERY_TIME = 30  # Интервал сохранения дневного и общего трафика в секундах
-SYNS_TIME = 5  # Интервал синхронизации клиентов в минутах
+EVERY_TIME = 30
+SYNC_TIME = 5
+_config_cache = {"mapping": {}, "mtime": 0}
 
-
-def get_stats_retention_days(default_days=365):
+def get_stats_retention_days(default_days: int = 365) -> int:
     try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
-            settings_data = json.load(settings_file)
-        days = int(settings_data.get("stats_retention_days", default_days))
-        return max(30, min(days, 3650))
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            settings_data = json.load(f)
+            days = int(settings_data.get("stats_retention_days", default_days))
+            return max(30, min(days, 3650))
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         return default_days
 
-
+def get_retention_windows(total_days: int) -> tuple[int, int, int]:
+    hourly_days = max(1, round(total_days * 30 / 365))
+    daily_days = max(hourly_days, round(total_days * 90 / 365))
+    monthly_days = max(daily_days, total_days)
+    return hourly_days, daily_days, monthly_days
 
 # =============================================================================
-# ФУНКЦИИ БАЗЫ ДАННЫХ
+# ФУНКЦИИ WIREGUARD (ОБНОВЛЕНЫ ПОД API)
 # =============================================================================
-def init_db():
-    """Инициализация базы данных"""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wg_daily_stats (
-            date TEXT NOT NULL,
-            peer TEXT NOT NULL,
-            client TEXT NOT NULL,
-            received INTEGER NOT NULL,
-            sent INTEGER NOT NULL,
-            interface TEXT NOT NULL,
-            PRIMARY KEY (date, peer, interface)
-            )
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wg_intermediate (
-            peer TEXT NOT NULL,
-            interface TEXT NOT NULL,
-            last_received INTEGER NOT NULL,
-            last_sent INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            PRIMARY KEY (peer, interface)
-            )
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wg_total_stats (
-            peer TEXT NOT NULL,
-            client TEXT NOT NULL,
-            total_received INTEGER NOT NULL,
-            total_sent INTEGER NOT NULL,
-            interface TEXT NOT NULL,
-            PRIMARY KEY (peer, interface)
-            )
-            """)
-            conn.commit()
-        logger.info("✅ База данных WireGuard инициализирована")
-    except Exception as e:
-        logger.error(f"❌ Ошибка инициализации БД: {e}")
-        raise
-
-def get_wg_intermediate(data="all"):
-    """Получение данных с таблицы wg_intermediate"""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            if data == "all":
-                cursor.execute("""SELECT * from wg_intermediate""")
-                intermediate = cursor.fetchall()
-                logger.debug(f"📊 Получено {len(intermediate)} записей из wg_intermediate")
-                return intermediate
-            if data == "date":
-                cursor.execute("""SELECT date from wg_intermediate""")
-                result = [row[0] for row in cursor.fetchall()]
-                return result[0] if result else None
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения данных из wg_intermediate: {e}")
+def get_wireguard_stats() -> Optional[List[Dict]]:
+    """Получение статистики через синхронное API Amnezia WG Easy."""
+    conn_info = AmneziaDiscoverer.get_connection_info()
+    if not conn_info:
+        logger.warning("⚠️ Контейнер Amnezia не найден через Docker")
         return None
 
-def get_wg_daily_stats():
-    """Получение данных с таблицы wg_daily_stats"""
+    ip, password, port = conn_info
+    base_url = f"http://{ip}:{port}"
+
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM wg_daily_stats")
-            rows = cursor.fetchall()
-            logger.debug(f"📊 Получено {len(rows)} записей из wg_daily_stats")
-            return rows
+        client = AmneziaApiSyncClient(base_url, password)
+        client.login()
+        return client.get_clients_stats()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Ошибка запроса к API Amnezia ({base_url}): {e}")
+        return None
     except Exception as e:
-        logger.error(f"❌ Ошибка получения данных из wg_daily_stats: {e}")
-        return []
+        logger.error(f"❌ Исключение при получении статистики WG: {e}", exc_info=True)
+        return None
 
-def get_wg_total_stats():
-    """Получение данных с таблицы wg_total_stats"""
+def parse_wireguard_stats(output: str | List[Dict]) -> List[Dict]:
+    """Адаптер: возвращает список как есть, если данные уже получены через API."""
+    if isinstance(output, list):
+        return output
+    return []
+
+def read_wg_config(file_path: str) -> dict[str, str]:
+    """Кэшированное чтение конфигурации клиентов (оставлено для fallback/отладки)."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""SELECT * from wg_total_stats""")
-            rows = cursor.fetchall()
-            logger.debug(f"📊 Получено {len(rows)} записей из wg_total_stats")
-            return rows
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения данных из wg_total_stats: {e}")
-        return []
-
-# =============================================================================
-# ФУНКЦИИ WIREGUARD
-# =============================================================================
-def get_wireguard_stats():
-    """Получение данных из wg show через Docker"""
-    try:
-        # 1. Получаем ID контейнера
-        id_result = subprocess.run(
-            ['docker', 'ps', '--filter', 'name=amnezia', '--format', '{{.ID}}'],
-            capture_output=True, text=True, check=True
-        )
-        container_id = id_result.stdout.strip().splitlines()[0] if id_result.stdout.strip() else None
-        
-        if not container_id:
-            logger.error("❌ Контейнер amnezia не найден")
-            return "Ошибка: Контейнер amnezia не найден"
-        
-        # 2. Выполняем wg show внутри контейнера
-        result = subprocess.run(
-            ['docker', 'exec', container_id, '/usr/bin/wg', 'show'],
-            capture_output=True, text=True, check=True
-        )
-        logger.debug("✅ Команда wg show выполнена успешно через Docker")
-        return result.stdout
-    
-    except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Ошибка Docker/wg: {e.stderr}")
-        return f"Ошибка выполнения команды: {e.stderr}"
-    except FileNotFoundError as e:
-        logger.error(f"❌ Команда docker не найдена: {e}")
-        return f"Ошибка: Команда docker не найдена"
-    except Exception as e:
-        logger.error(f"❌ Исключение при получении статистики WG: {e}")
-        return f"Ошибка: {str(e)}"
-
-
-def read_wg_config(file_path):
-    """Считывает клиентские данные из JSON конфигурационного файла WireGuard."""
-    client_mapping = {}
-    
-    # Проверяем, какой файл передан. Если просят .conf, но есть .json — используем JSON.
+        mtime = os.path.getmtime(file_path) if os.path.exists(file_path) else 0
+    except OSError:
+        mtime = 0
     if file_path.endswith(".conf"):
         json_path = file_path.replace(".conf", ".json")
         if os.path.exists(json_path):
             file_path = json_path
-        else:
-            # Если JSON нет, оставляем путь к .conf для старого парсера ниже
-            pass
 
+    if _config_cache["mapping"] and mtime <= _config_cache["mtime"]:
+        return _config_cache["mapping"]
+
+    client_mapping = {}
     try:
         if file_path.endswith(".json"):
-            with open(file_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-            
-            # Убираем пробелы из ключей верхнего уровня (на случай "clients ")
-            data = {k.strip(): v for k, v in data.items()}
-            clients = data.get("clients", {})
-            
-            for client_id, client_info in clients.items():
-                # Очищаем ключи и строковые значения от пробелов
-                clean_info = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in client_info.items()}
-                
-                public_key = clean_info.get("publicKey", "").strip()
-                name = clean_info.get("name", "N/A").strip()
-                
-                if public_key:
-                    client_mapping[public_key] = name
-            
-            logger.debug(f"✅ Прочитано {len(client_mapping)} клиентов из {file_path} (JSON)")
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for client_id, client_info in data.get("clients", {}).items():
+                    clean = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in client_info.items()}
+                    pub_key = clean.get("publicKey", "").strip()
+                    name = clean.get("name", "N/A").strip()
+                    if pub_key:
+                        client_mapping[pub_key] = name
         else:
-            # Старый парсер .conf (оставлен как запасной вариант)
-            current_client_name = None
-            with open(file_path, "r", encoding="utf-8") as file:
-                for line in file:
+            current_name = None
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
                     line = line.strip()
                     if line.startswith("# Client:"):
-                        current_client_name = line.split(":", 1)[1].strip().split("(")[0].strip()
+                        current_name = line.split(":", 1)[1].strip().split("(")[0].strip()
                     elif line.startswith("[Peer]"):
-                        current_client_name = current_client_name or "N/A"
-                    elif line.startswith("PublicKey =") and current_client_name:
-                        public_key = line.split("=", 1)[1].strip()
-                        client_mapping[public_key] = current_client_name
-            logger.debug(f"✅ Прочитано {len(client_mapping)} клиентов из {file_path} (CONF)")
-            
+                        current_name = current_name or "N/A"
+                    elif line.startswith("PublicKey =") and current_name:
+                        pub_key = line.split("=", 1)[1].strip()
+                        client_mapping[pub_key] = current_name
+        logger.debug(f"🔄 Кэш конфигурации обновлён: {len(client_mapping)} клиентов")
+        _config_cache["mapping"] = client_mapping
+        _config_cache["mtime"] = mtime
     except FileNotFoundError:
         logger.warning(f"⚠️ Конфигурационный файл {file_path} не найден")
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Ошибка парсинга JSON {file_path}: {e}")
     except Exception as e:
-        logger.error(f"❌ Ошибка чтения конфига {file_path}: {e}")
-    
+        logger.error(f"❌ Ошибка чтения конфига {file_path}: {e}", exc_info=True)
     return client_mapping
 
-
-def convert_to_bytes(value):
-    """Преобразует значение в байты."""
+def convert_to_bytes(value: str | int | float) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return 0
+    value = value.strip()
+    if not value or value in ("0 B", "0B"):
+        return 0
     units = {
         "B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4,
         "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
     }
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value or value in ("0 B", "0B"):
-            return 0
-        parts = value.split()
-        if len(parts) == 1:
-            return int(parts[0]) if parts[0].isdigit() else 0
-        elif len(parts) == 2:
-            num, unit = parts
-            return int(float(num) * units.get(unit, 1)) if unit in units else 0
+    parts = value.split()
+    if len(parts) == 1 and parts[0].replace('.', '', 1).isdigit():
+        return int(float(parts[0]))
+    if len(parts) == 2:
+        num, unit = parts
+        return int(float(num) * units.get(unit, 1))
     return 0
 
-def parse_wireguard_stats(output):
-    """Парсинг вывода wg show, извлекаем только peer, client, received, sent, interface."""
-    stats = []
-    lines = output.strip().splitlines()
-    interface_name = None
-    client_mapping = read_wg_config("/root/web/awg/wg0.json")
-    
-    for line in lines:
-        line = line.strip()
-        if line.startswith("interface:"):
-            interface_name = line.split(": ")[1]
-        elif line.startswith("peer:"):
-            peer = line.split(": ")[1].strip()
-            client_name = client_mapping.get(peer, "Unknown")
-            stats.append({
-                "peer": peer,
-                "client": client_name,
-                "received": "0 B",
-                "sent": "0 B",
-                "interface": interface_name if interface_name else "Unknown",
-            })
-        elif line.startswith("transfer:") and stats:
-            transfer_data = line.split(":")[1].strip().split(", ")
-            stats[-1]["received"] = transfer_data[0].replace(" received", "").strip()
-            stats[-1]["sent"] = transfer_data[1].replace(" sent", "").strip()
-    
-    logger.debug(f"✅ Распарсено {len(stats)} пиров WireGuard")
-    return stats
+# =============================================================================
+# ФУНКЦИИ БАЗЫ ДАННЫХ
+# =============================================================================
+def init_db() -> None:
+    tables = [
+        ("wg_daily_stats", "(date TEXT NOT NULL, peer TEXT NOT NULL, client TEXT NOT NULL, received INTEGER NOT NULL, sent INTEGER NOT NULL, interface TEXT NOT NULL, PRIMARY KEY (date, peer, interface))"),
+        ("wg_intermediate", "(peer TEXT NOT NULL, interface TEXT NOT NULL, last_received INTEGER NOT NULL, last_sent INTEGER NOT NULL, date TEXT NOT NULL, PRIMARY KEY (peer, interface))"),
+        ("wg_total_stats", "(peer TEXT NOT NULL, client TEXT NOT NULL, total_received INTEGER NOT NULL, total_sent INTEGER NOT NULL, interface TEXT NOT NULL, PRIMARY KEY (peer, interface))"),
+        ("wg_hourly_stats", "(hour TEXT NOT NULL, peer TEXT NOT NULL, client TEXT NOT NULL, received INTEGER NOT NULL, sent INTEGER NOT NULL, interface TEXT NOT NULL, PRIMARY KEY (hour, peer, interface))"),
+        ("wg_monthly_stats", "(month TEXT NOT NULL, peer TEXT NOT NULL, client TEXT NOT NULL, received INTEGER NOT NULL, sent INTEGER NOT NULL, interface TEXT NOT NULL, PRIMARY KEY (month, peer, interface))"),
+    ]
+    with sqlite3.connect(DB_PATH) as conn:
+        for name, schema in tables:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {name} {schema}")
+    logger.info("✅ База данных WireGuard инициализирована")
 
-def clear_wg_total_stats():
-    """Очистка таблицы wg_total_stats от лишних записей"""
+def clear_wg_total_stats() -> bool:
     try:
-        output = get_wireguard_stats()
-        stats = parse_wireguard_stats(output)
+        stats = get_wireguard_stats()
+        if not stats:
+            return False
+        current_peers = {(d["peer"], d["interface"]) for d in stats}
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            current_peers = {(data["peer"], data["interface"]) for data in stats}
             cursor.execute("SELECT peer, interface FROM wg_total_stats")
             db_peers = set(cursor.fetchall())
-            peers_to_remove = db_peers - current_peers
-            
-            for peer, interface in peers_to_remove:
-                cursor.execute(
-                    "DELETE FROM wg_total_stats WHERE peer = ? AND interface = ?",
-                    (peer, interface),
-                )
-            conn.commit()
-            
-            if peers_to_remove:
-                logger.info(f"🧹 Удалено {len(peers_to_remove)} устаревших пиров из wg_total_stats")
-            return True
-    except sqlite3.Error as e:
-        logger.error(f"❌ Ошибка SQLite при очистке таблицы: {e}")
-        return False
+            to_remove = db_peers - current_peers
+            if to_remove:
+                conn.executemany("DELETE FROM wg_total_stats WHERE peer = ? AND interface = ?", to_remove)
+                logger.info(f"🧹 Удалено {len(to_remove)} устаревших пиров из wg_total_stats")
+        return True
     except Exception as e:
-        logger.error(f"❌ Ошибка при очистке wg_total_stats: {e}")
+        logger.error(f"❌ Ошибка очистки wg_total_stats: {e}", exc_info=True)
         return False
+
+def sync_new_peers() -> None:
+    if not clear_wg_total_stats():
+        logger.warning("⚠️ Очистка wg_total_stats пропущена, синхронизация отменена")
+        return
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                INSERT INTO wg_intermediate (peer, interface, last_received, last_sent, date)
+                SELECT t.peer, t.interface, 0, 0, ?
+                FROM wg_total_stats t
+                LEFT JOIN wg_intermediate i ON t.peer = i.peer AND t.interface = i.interface
+                WHERE i.peer IS NULL
+                GROUP BY t.peer, t.interface
+            """, (datetime.now().strftime("%Y-%m-%d"),))
+            if conn.total_changes > 0:
+                logger.info(f"🔄 Синхронизировано {conn.total_changes} новых пиров")
+    except Exception as e:
+        logger.error(f"❌ Ошибка синхронизации новых пиров: {e}", exc_info=True)
 
 # =============================================================================
-# ФУНКЦИИ СОХРАНЕНИЯ СТАТИСТИКИ
+# СОХРАНЕНИЕ И ОЧИСТКА
 # =============================================================================
-def save_wg_stats():
-    """Функция сохранения статистики"""
+_last_cleanup_date = None
+def clean_old_daily_stats(days: int = 365) -> None:
+    global _last_cleanup_date
+    today = datetime.now().date()
+    if _last_cleanup_date == today:
+        return
     try:
-        output = get_wireguard_stats()
-        if not output or output.startswith("Ошибка"):
-            logger.warning(f"⚠️ Нет данных для сохранения: {output}")
-            return
-        
-        stats = parse_wireguard_stats(output)
-        now = datetime.now().strftime("%H:%M:%S")
-        logger.debug(f"🕐 Сохранение статистики: {now} (пиров: {len(stats)})")
-        
-        clean_old_daily_stats(get_stats_retention_days(default_days=365))
-        
+        hourly_days, daily_days, monthly_days = get_retention_windows(days)
+        now = datetime.now()
         with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            now_dt = datetime.now()
-            
-            for data in stats:
-                peer = data["peer"]
-                date = now_dt.strftime("%Y-%m-%d")
-                client = data["client"]
-                received_now = convert_to_bytes(data["received"])
-                sent_now = convert_to_bytes(data["sent"])
-                interface = data["interface"]
-                
-                if now_dt.hour == 0 and now_dt.minute == 0 and now_dt.second <= 5:
-                    cursor.execute(
-                        """INSERT OR REPLACE INTO wg_intermediate
-                        (peer, interface, last_received, last_sent, date)
-                        VALUES (?, ?, ?, ?, ?)""",
-                        (peer, interface, received_now, sent_now, date),
-                    )
-                
-                cursor.execute(
-                    """INSERT OR REPLACE INTO wg_total_stats
-                    (peer, client, total_received, total_sent, interface)
-                    VALUES (?, ?, ?, ?, ?)""",
-                    (peer, client, received_now, sent_now, interface),
-                )
-            
-            conn.commit()
-        logger.debug("✅ Статистика WireGuard сохранена в wg_total_stats")
-    
-    except Exception as e:
-        logger.error(f"❌ Ошибка сохранения статистики WG: {e}")
-
-def save_daily_stats(dailysave=False):
-    """Функция сохранения статистики за день"""
-    try:
-        output = get_wireguard_stats()
-        if not output or output.startswith("Ошибка"):
-            logger.warning(f"⚠️ Нет данных для ежедневного сохранения: {output}")
-            return False
-        
-        stats = parse_wireguard_stats(output)
-        date = datetime.now().strftime("%Y-%m-%d")
-        now = datetime.now().strftime("%H:%M:%S")
-        
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            if dailysave:
-                # Фиксирование дневной статистики в wg_intermediate
-                logger.info(f"📊 Фиксирование дневной статистики: {now}")
-                for data in stats:
-                    try:
-                        cursor.execute(
-                            """INSERT OR REPLACE INTO wg_intermediate
-                            (peer, interface, last_received, last_sent, date)
-                            VALUES (?, ?, ?, ?, ?)""",
-                            (
-                                data["peer"],
-                                data["interface"],
-                                convert_to_bytes(data["received"]),
-                                convert_to_bytes(data["sent"]),
-                                date,
-                            ),
-                        )
-                    except sqlite3.Error as e:
-                        logger.error(f"❌ Ошибка при сохранении {data['peer']}: {e}")
-                conn.commit()
-                logger.info("✅ Дневная статистика зафиксирована")
-                return True
-            else:
-                # Ежедневное сохранение статистики в wg_daily_stats
-                current_stats = get_wg_total_stats()
-                intermediate_stats = get_wg_intermediate()
-                
-                intermediate_dict = {(row[0], row[1]): row for row in intermediate_stats}
-                updated_count = 0
-                inserted_count = 0
-                
-                for stats_row in current_stats:
-                    peer, client = stats_row[0], stats_row[1]
-                    interface = stats_row[4]
-                    key = (peer, interface)
-                    
-                    if key in intermediate_dict:
-                        inter_row = intermediate_dict[key]
-                        current_received = int(stats_row[2])
-                        current_sent = int(stats_row[3])
-                        last_received = int(inter_row[2])
-                        last_sent = int(inter_row[3])
-                        
-                        if current_received >= last_received and current_sent >= last_sent:
-                            received_diff = current_received - last_received
-                            sent_diff = current_sent - last_sent
-                        else:
-                            logger.warning(
-                                f"⚠️ Обнаружен сброс счетчиков для {peer} на {interface}. "
-                                f"Сохраняем текущие значения."
-                            )
-                            received_diff = current_received
-                            sent_diff = current_sent
-                        
-                        cursor.execute(
-                            """SELECT 1 FROM wg_daily_stats
-                            WHERE date = ? AND peer = ? AND interface = ?""",
-                            (date, peer, interface),
-                        )
-                        exists = cursor.fetchone()
-                        
-                        if exists:
-                            cursor.execute(
-                                """UPDATE wg_daily_stats
-                                SET received = ?, sent = ?, client = ?
-                                WHERE date = ? AND peer = ? AND interface = ?""",
-                                (
-                                    convert_to_bytes(received_diff),
-                                    convert_to_bytes(sent_diff),
-                                    client,
-                                    date,
-                                    peer,
-                                    interface,
-                                ),
-                            )
-                            updated_count += 1
-                        else:
-                            cursor.execute(
-                                """INSERT INTO wg_daily_stats
-                                (date, peer, client, received, sent, interface)
-                                VALUES (?, ?, ?, ?, ?, ?)""",
-                                (
-                                    date,
-                                    peer,
-                                    client,
-                                    convert_to_bytes(received_diff),
-                                    convert_to_bytes(sent_diff),
-                                    interface,
-                                ),
-                            )
-                            inserted_count += 1
-                
-                conn.commit()
-                logger.info(
-                    f"✅ Ежедневная статистика сохранена: "
-                    f"обновлено={updated_count}, добавлено={inserted_count}"
-                )
-                return True
-    
-    except Exception as e:
-        logger.error(f"❌ Ошибка при ежедневном сохранении: {e}")
-        return False
-
-def sync_new_peers():
-    """Добавляет новые peer+interface из wg_total_stats в wg_intermediate"""
-    try:
-        if not clear_wg_total_stats():
-            logger.warning("⚠️ Не удалось очистить wg_total_stats, пропускаем синхронизацию")
-            return
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        try:
-            date = datetime.now().strftime("%Y-%m-%d")
-            cursor.execute("""
-            SELECT t.peer, t.interface
-            FROM wg_total_stats t
-            LEFT JOIN wg_intermediate i
-            ON t.peer = i.peer AND t.interface = i.interface
-            WHERE i.peer IS NULL
-            GROUP BY t.peer, t.interface
+            conn.execute("""
+                INSERT INTO wg_monthly_stats (month, peer, client, received, sent, interface)
+                SELECT substr(date, 1, 7), peer, MAX(client), SUM(received), SUM(sent), interface
+                FROM wg_daily_stats
+                GROUP BY peer, interface, substr(date, 1, 7)
+                ON CONFLICT(month, peer, interface) DO UPDATE SET
+                received = excluded.received, sent = excluded.sent, client = excluded.client
             """)
-            new_combinations = cursor.fetchall()
-            
-            for peer, interface in new_combinations:
-                cursor.execute("""
-                INSERT INTO wg_intermediate
-                (peer, interface, last_received, last_sent, date)
-                VALUES (?, ?, 0, 0, ?)
-                """, (peer, interface, date))
-            
-            conn.commit()
-            
-            if new_combinations:
-                logger.info(f"🔄 Синхронизировано {len(new_combinations)} новых пиров")
-            else:
-                logger.debug("ℹ️ Новых пиров для синхронизации не найдено")
-        
-        except sqlite3.Error as e:
-            logger.error(f"❌ Ошибка при синхронизации новых клиентов: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
-    
+            conn.execute("DELETE FROM wg_hourly_stats WHERE hour < ?", ((now - timedelta(days=hourly_days)).strftime("%Y-%m-%d"),))
+            conn.execute("DELETE FROM wg_daily_stats WHERE date < ?", ((now - timedelta(days=daily_days)).strftime("%Y-%m-%d"),))
+            conn.execute("DELETE FROM wg_monthly_stats WHERE month < ?", ((now - timedelta(days=monthly_days)).strftime("%Y-%m"),))
+        _last_cleanup_date = today
+        logger.debug("🧹 Очистка старых записей выполнена")
     except Exception as e:
-        logger.error(f"❌ Ошибка в sync_new_peers: {e}")
+        logger.error(f"❌ Ошибка очистки старых записей: {e}", exc_info=True)
 
-# =============================================================================
-# ФУНКЦИИ ОЧИСТКИ
-# =============================================================================
-def clean_old_daily_stats(days=7):
-    """Удаление старых записей из wg_daily_stats"""
+def save_wg_stats() -> None:
+    now_dt = datetime.now()
+    if now_dt.hour == 0 and now_dt.minute == 0 and now_dt.second <= 5:
+        stats = get_wireguard_stats()
+        if not stats:
+            return
+        date = now_dt.strftime("%Y-%m-%d")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO wg_intermediate (peer, interface, last_received, last_sent, date) VALUES (?, ?, ?, ?, ?)",
+                [(d["peer"], d["interface"], convert_to_bytes(d["received"]), convert_to_bytes(d["sent"]), date) for d in stats]
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO wg_total_stats (peer, client, total_received, total_sent, interface) VALUES (?, ?, ?, ?, ?)",
+                [(d["peer"], d["client"], convert_to_bytes(d["received"]), convert_to_bytes(d["sent"]), d["interface"]) for d in stats]
+            )
+        logger.info("✅ Статистика за полночь сохранена в wg_total_stats")
+    clean_old_daily_stats(get_stats_retention_days())
+
+def save_daily_stats(dailysave: bool = False) -> bool:
     try:
-        cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        
+        stats = get_wireguard_stats()
+        if not stats:
+            return False
+
+        date = datetime.now().strftime("%Y-%m-%d")
+        now_str = datetime.now().strftime("%H:%M:%S")
+        if dailysave:
+            logger.info(f"📊 Фиксирование дневной статистики: {now_str}")
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO wg_intermediate (peer, interface, last_received, last_sent, date) VALUES (?, ?, ?, ?, ?)",
+                    [(d["peer"], d["interface"], convert_to_bytes(d["received"]), convert_to_bytes(d["sent"]), date) for d in stats]
+                )
+            logger.info("✅ Дневная статистика зафиксирована")
+            return True
+
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """SELECT COUNT(*) FROM wg_daily_stats WHERE date < ?""",
-                (cutoff_date,),
-            )
-            count = cursor.fetchone()[0]
-            
-            if count > 0:
-                cursor.execute(
-                    """DELETE FROM wg_daily_stats WHERE date < ?""", 
-                    (cutoff_date,)
-                )
-                conn.commit()
-                logger.info(f"🧹 Удалено {count} записей старше {cutoff_date}")
-            else:
-                logger.debug(f"ℹ️ Нет записей старше {cutoff_date} для удаления")
-    
-    except sqlite3.Error as e:
-        logger.error(f"❌ Ошибка при очистке старых записей: {e}")
+            cursor.execute("SELECT peer, client, total_received, total_sent, interface FROM wg_total_stats")
+            total_stats = { (r[0], r[4]): r for r in cursor.fetchall() }
+            cursor.execute("SELECT peer, interface, last_received, last_sent FROM wg_intermediate")
+            intermediate = { (r[0], r[1]): r for r in cursor.fetchall() }
+            hour = datetime.now().strftime("%Y-%m-%d %H:00")
+            updated = inserted = 0
+            for key, total in total_stats.items():
+                if key not in intermediate:
+                    continue
+                peer, interface = key
+                client = total[1]
+                curr_rx, curr_tx = int(total[2]), int(total[3])
+                last_rx, last_tx = int(intermediate[key][2]), int(intermediate[key][3])
+                rx_diff = curr_rx - last_rx if curr_rx >= last_rx else curr_rx
+                tx_diff = curr_tx - last_tx if curr_tx >= last_tx else curr_tx
+                if rx_diff < 0 or tx_diff < 0:
+                    logger.warning(f"⚠️ Сброс счётчиков {peer} ({interface}), используем текущие")
+                    rx_diff, tx_diff = curr_rx, curr_tx
+                b_rx, b_tx = convert_to_bytes(rx_diff), convert_to_bytes(tx_diff)
+                cursor.execute("SELECT 1 FROM wg_daily_stats WHERE date=? AND peer=? AND interface=?", (date, peer, interface))
+                if cursor.fetchone():
+                    cursor.execute("UPDATE wg_daily_stats SET received=?, sent=?, client=? WHERE date=? AND peer=? AND interface=?",
+                                   (b_rx, b_tx, client, date, peer, interface))
+                    updated += 1
+                else:
+                    cursor.execute("INSERT INTO wg_daily_stats (date, peer, client, received, sent, interface) VALUES (?,?,?,?,?,?)",
+                                   (date, peer, client, b_rx, b_tx, interface))
+                cursor.execute("SELECT COALESCE(SUM(received),0), COALESCE(SUM(sent),0) FROM wg_hourly_stats WHERE peer=? AND interface=? AND substr(hour,1,10)=? AND hour!=?",
+                               (peer, interface, date, hour))
+                prev_h_rx, prev_h_tx = cursor.fetchone()
+                cursor.execute("INSERT OR REPLACE INTO wg_hourly_stats (hour, peer, client, received, sent, interface) VALUES (?,?,?,?,?,?)",
+                               (hour, peer, client, max(0, b_rx - prev_h_rx), max(0, b_tx - prev_h_tx), interface))
+                inserted += 1
+            logger.debug(f"✅ Ежедневная статистика: upd={updated}, ins={inserted}")
+            return True
     except Exception as e:
-        logger.error(f"❌ Ошибка в clean_old_daily_stats: {e}")
+        logger.error(f"❌ Ошибка ежедневного сохранения: {e}", exc_info=True)
+        return False
 
 # =============================================================================
 # ТАЙМЕРЫ И ЗАПУСК
 # =============================================================================
-timer_1 = None
-timer_2 = None
-timer_3 = None
+_jobs = []
+def _start_timers():
+    global _jobs
+    _jobs = [
+        schedule.every(EVERY_TIME).seconds.do(save_daily_stats),
+        schedule.every(EVERY_TIME).seconds.do(save_wg_stats),
+        schedule.every(SYNC_TIME).minutes.do(sync_new_peers)
+    ]
+    logger.info(f"✅ Таймеры запущены: каждые {EVERY_TIME} сек (статистика), каждые {SYNC_TIME} мин (синхронизация)")
 
-def start_timers():
-    """Запуск таймеров"""
-    global timer_1, timer_2, timer_3
-    timer_1 = schedule.every(EVERY_TIME).seconds.do(save_daily_stats)
-    timer_2 = schedule.every(EVERY_TIME).seconds.do(save_wg_stats)
-    timer_3 = schedule.every(SYNS_TIME).minutes.do(sync_new_peers)
-    logger.info(f"✅ Таймеры запущены: каждые {EVERY_TIME} сек (статистика), каждые {SYNS_TIME} мин (синхронизация)")
-
-def stop_timers():
-    """Остановка таймеров на время фиксирования ежедневной статистики"""
-    global timer_1, timer_2, timer_3
-    schedule.cancel_job(timer_1)
-    schedule.cancel_job(timer_2)
-    schedule.cancel_job(timer_3)
-    logger.info("⏸️ Таймеры остановлены для фиксирования дневной статистики")
+def _stop_and_reset_daily():
+    global _jobs
+    for job in _jobs:
+        schedule.cancel_job(job)
+    _jobs = []
+    logger.info("⏸️ Таймеры остановлены для финального сохранения за сутки")
     time.sleep(2)
     save_daily_stats(True)
-    logger.info("▶️ Таймеры будут перезапущены в 00:00")
+    logger.info("▶️ Таймеры перезапущены после фиксации дневной статистики")
+    _start_timers()
 
 def main():
-    """Основная функция"""
     logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК WG_STATS.PY (Сбор статистики WireGuard)")
+    logger.info("🚀 ЗАПУСК WG_STATS.PY (Сбор статистики WireGuard через API)")
     logger.info("=" * 60)
-    logger.info(f"📍 Версия Python: {__import__('sys').version.split()[0]}")
-    logger.info(f"📁 Путь к БД: {DB_PATH}")
-    logger.info(f"📁 Путь к логам: {LOG_DIR}")
-    logger.info(f"⏰ Интервал сохранения: {EVERY_TIME} сек")
-    logger.info(f"⏰ Интервал синхронизации: {SYNS_TIME} мин")
-    logger.info(f"📅 Срок хранения статистики: {get_stats_retention_days(default_days=365)} дней")
-    
+    logger.info(f"📍 Python: {__import__('sys').version.split()[0]}")
+    logger.info(f"📁 БД: {DB_PATH} | Логи: {LOG_DIR}")
+    logger.info(f"📅 Хранение: {get_stats_retention_days()} дней")
     try:
         init_db()
-        
-        inter_date = get_wg_intermediate("date")
-        if not inter_date:
-            inter_date = datetime.now().strftime("%Y-%m-%d")
-            logger.info(f"ℹ️ Дата в wg_intermediate не найдена, используем текущую: {inter_date}")
-        
-        today_date = datetime.now().strftime("%Y-%m-%d")
-        if inter_date != today_date:
-            logger.info(f"📊 Обнаружена новая дата ({today_date}), фиксируем дневную статистику")
-            save_daily_stats(True)
-            time.sleep(3)
-        
-        clean_old_daily_stats(days=get_stats_retention_days(default_days=365))
-        time.sleep(3)
-        
-        start_timers()
-        
-        logger.info("🔄 Запуск основного цикла...")
+        inter_date = datetime.now().strftime("%Y-%m-%d")
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute("SELECT date FROM wg_intermediate LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                inter_date = row[0]
+            if inter_date != datetime.now().strftime("%Y-%m-%d"):
+                logger.info(f"📊 Обнаружена смена даты. Фиксируем статистику...")
+                save_daily_stats(True)
+                time.sleep(2)
+                clean_old_daily_stats(get_stats_retention_days())
+                time.sleep(1)
+        _start_timers()
+        schedule.every().day.at("23:59:55").do(_stop_and_reset_daily)
+        logger.info("🔄 Основной цикл запущен...")
         while True:
             schedule.run_pending()
             time.sleep(1)
-    
     except KeyboardInterrupt:
-        logger.info("🛑 Получен сигнал остановки, завершаем работу")
+        logger.info("🛑 Получен сигнал остановки")
     except Exception as e:
-        logger.critical(f"❌ Фатальная ошибка: {e}", exc_info=True)
-        raise
+        logger.critical("❌ Фатальная ошибка", exc_info=True)
     finally:
         logger.info("=" * 60)
         logger.info("🏁 WG_STATS.PY завершён")

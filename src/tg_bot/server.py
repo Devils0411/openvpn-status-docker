@@ -1,13 +1,15 @@
 """Функции мониторинга и статистики сервера."""
 
 import asyncio
-import datetime
 import re
 import subprocess
 import logging
 
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
 from src.config import Config
+from .config import get_user_timezone
 from .utils import get_color_by_percent, format_vpn_clients, parse_handshake_time, is_peer_online, read_wg_config
 
 logger = logging.getLogger("tg_bot")
@@ -85,7 +87,7 @@ async def get_server_stats():
 
         download_speed, upload_speed = await get_network_speed(main_interface, interval=1.0)
         
-        vpn_clients = _count_online_clients()
+        vpn_clients = await _count_online_clients()
         clients_section = format_vpn_clients(vpn_clients)
         
         stats_text = f"""
@@ -148,14 +150,29 @@ async def get_services_status_text():
     return "\n".join(lines)
 
 
-def _format_connected_dt(dt: Optional[datetime.datetime]) -> str:
-    """Краткая строка времени для сообщения в Telegram."""
+def _format_connected_dt(dt: Optional[datetime], user_id: int = None) -> str:
+    """Краткая строка времени с учетом временной зоны пользователя."""
     if not dt:
         return "—"
-    return dt.strftime("%d.%m.%Y %H:%M")
+    
+    # Делаем datetime timezone-aware (предполагаем, что dt в UTC)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    
+    # Получаем временную зону пользователя
+    user_tz_name = get_user_timezone(user_id) if user_id else "Europe/Moscow"
+    try:
+        user_tz = ZoneInfo(user_tz_name)
+        local_dt = dt.astimezone(user_tz)
+        return local_dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        # Fallback на Москву при ошибке
+        moscow_tz = ZoneInfo("Europe/Moscow")
+        local_dt = dt.astimezone(moscow_tz)
+        return local_dt.strftime("%d.%m.%Y %H:%M")
 
 
-def get_openvpn_online_entries():
+def get_openvpn_online_entries(user_id: int = None):
     """Получает список активных клиентов OpenVPN из логов."""
     entries = []
     file_paths = Config.LOG_FILES
@@ -176,10 +193,10 @@ def get_openvpn_online_entries():
                     if len(parts) > 7:
                         try:
                             raw = parts[7].strip()
-                            start_dt = datetime.datetime.strptime(
+                            start_dt = datetime.strptime(
                                 raw, "%Y-%m-%d %H:%M:%S"
                             )
-                            connected = _format_connected_dt(start_dt)
+                            connected = _format_connected_dt(start_dt, user_id=user_id)
                         except (ValueError, IndexError):
                             pass
                     entries.append(
@@ -280,20 +297,40 @@ def _parse_wireguard_online_entries(output: str):
     return entries
 
 
-async def get_wireguard_online_entries():
-    """Получить список онлайн-клиентов WireGuard с деталями."""
+async def get_amnezia_online_entries(user_id: int = None):
+    """Получить список онлайн-клиентов AmneziaWG через API."""
+    from .bot import get_amnezia_client
+    amnezia = await get_amnezia_client()
+    
+    if not amnezia:
+        return []
+    
     try:
-        process = await asyncio.create_subprocess_exec(
-            "/usr/bin/wg",
-            "show",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await process.communicate()
-        if process.returncode != 0:
-            return []
-        return _parse_wireguard_online_entries(stdout.decode())
-    except Exception:
+        clients = await amnezia.get_clients()
+        online_clients = []
+        
+        for client in clients:
+            # Проверяем latestHandshakeAt - если handshake был недавно, клиент онлайн
+            if client.get("latestHandshakeAt"):
+                try:
+                    # Парсим время последнего handshake
+                    handshake_time = datetime.fromisoformat(
+                        client["latestHandshakeAt"].replace("Z", "+00:00")
+                    )
+                    # Если handshake был в последние 3 минуты - клиент онлайн
+                    if datetime.now(handshake_time.tzinfo) - handshake_time < timedelta(minutes=3):
+                        online_clients.append({
+                            "name": client.get("name", "Unknown"),
+                            "protocol": "AmneziaWG",
+                            "connected": _format_connected_dt(handshake_time, user_id=user_id)
+                        })
+                except Exception as e:
+                    logger.debug(f"⚠️ Ошибка парсинга времени handshake: {e}")
+                    continue
+        
+        return online_clients
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения онлайн-клиентов Amnezia: {e}")
         return []
 
 
@@ -302,10 +339,10 @@ def _format_online_line(entry: dict) -> str:
     return f"• <b>{entry['name']}</b> · с {entry['connected']}"
 
 
-async def get_online_clients_text():
+async def get_online_clients_text(user_id: int = None):
     """Получить отформатированный текст онлайн-клиентов."""
-    openvpn_entries = get_openvpn_online_entries()
-    wg_entries = await get_wireguard_online_entries()
+    openvpn_entries = get_openvpn_online_entries(user_id=user_id)
+    amnezia_entries = await get_amnezia_online_entries(user_id=user_id)
     
     lines = ["<b>👥 Кто онлайн:</b>", ""]
     
@@ -317,11 +354,11 @@ async def get_online_clients_text():
     
     lines.append("")
     
-    if wg_entries:
-        lines.append("<b>WireGuard:</b>")
-        lines.extend(_format_online_line(e) for e in wg_entries)
+    if amnezia_entries:
+        lines.append("<b>AmneziaWG:</b>")
+        lines.extend(_format_online_line(e) for e in amnezia_entries)
     else:
-        lines.append("<b>WireGuard:</b> нет активных клиентов")
+        lines.append("<b>AmneziaWG:</b> нет активных клиентов")
     
     return "\n".join(lines)
 
@@ -366,42 +403,45 @@ def _format_uptime(uptime_string):
     return " ".join(result)
 
 
-def _count_online_clients():
-    """Подсчитать онлайн-клиентов VPN."""
-   
-    total_openvpn = 0
-    results = {}
-    
-    file_paths = Config.LOG_FILES
-    
+async def _count_online_clients():
+    """Асинхронный подсчёт онлайн-клиентов."""
+    # 1. Считаем OpenVPN синхронно в отдельном потоке (не блокирует event loop)
+    def _count_ovpn_sync():
+        total = 0
+        for path, _ in Config.LOG_FILES:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("CLIENT_LIST"):
+                            total += 1
+            except Exception:
+                continue
+        return total
+
     try:
-        wg_output = subprocess.check_output(["/usr/bin/wg", "show"], text=True)
-        wg_latest_handshakes = re.findall(r"latest handshake: (.+)", wg_output)
-        
-        online_wg = 0
-        for handshake in wg_latest_handshakes:
-            handshake_str = handshake.strip()
-            if handshake_str == "0 seconds ago":
-                online_wg += 1
-            else:
-                try:
-                    handshake_time = parse_handshake_time(handshake_str)
-                    if handshake_time and is_peer_online(handshake_time):
-                        online_wg += 1
-                except Exception:
-                    continue
-        results["WireGuard"] = online_wg
-    except Exception:
-        results["WireGuard"] = 0
-    
-    for path, _ in file_paths:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("CLIENT_LIST"):
-                        total_openvpn += 1
-        except Exception:
-            continue
-    
-    results["OpenVPN"] = total_openvpn
-    return results
+        total_openvpn = await asyncio.to_thread(_count_ovpn_sync)
+    except Exception as e:
+        logger.error(f"Ошибка подсчёта OpenVPN: {e}")
+        total_openvpn = 0
+
+    # 2. Считаем AmneziaWG асинхронно в основном цикле (без to_thread!)
+    online_amnezia = 0
+    try:
+        from src.tg_bot.bot import get_amnezia_client
+        amnezia = await get_amnezia_client()
+        if amnezia:
+            clients = await amnezia.get_clients()
+            for client in clients:
+                if client.get("latestHandshakeAt"):
+                    try:
+                        handshake_time = datetime.fromisoformat(
+                            client["latestHandshakeAt"].replace("Z", "+00:00")
+                        )
+                        if datetime.now(handshake_time.tzinfo) - handshake_time < timedelta(minutes=3):
+                            online_amnezia += 1
+                    except Exception:
+                        continue
+    except Exception as e:
+        logger.debug(f"⚠️ Не удалось получить клиентов Amnezia: {e}")
+
+    return {"OpenVPN": total_openvpn, "AmneziaWG": online_amnezia}

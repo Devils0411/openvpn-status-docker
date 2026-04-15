@@ -82,7 +82,7 @@ async def handle_server_online(callback: types.CallbackQuery):
         await callback.answer("Доступ запрещен!", show_alert=True)
         return
 
-    online_text = await get_online_clients_text()
+    online_text = await get_online_clients_text(user_id=callback.from_user.id)
     await callback.message.edit_text(online_text, reply_markup=create_back_keyboard("server_menu"))
     await callback.answer()
 

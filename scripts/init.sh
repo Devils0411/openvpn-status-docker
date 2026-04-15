@@ -23,6 +23,7 @@ ENV_FILE="$ROOT_DIR/src/data/.env"
 SERVICE_FILE="/etc/supervisord.conf"
 VNSTAT_CONF_FILE="/etc/vnstat.conf"
 NEW_DATABASE_DIR="$DB_DIR/vnstat"
+WORKER_COUNT=2
 
 # ==========================================
 # Автоматические параметры (ENV)
@@ -73,7 +74,7 @@ update_service_ip() {
         flask_port=$DEFAULT_PORT
     fi
     if [[ -f "$SERVICE_FILE" ]]; then
-        sed -i "s|command=gunicorn -w 4 main:app -b .*:[0-9]*|command=gunicorn -w 4 main:app -b $new_ip:$flask_port|" "$SERVICE_FILE"
+        sed -i "s|command=gunicorn -w $WORKER_COUNT main:app -b .*:[0-9]*|command=gunicorn -w $WORKER_COUNT main:app -b $new_ip:$flask_port|" "$SERVICE_FILE"
         echo -e "${GREEN}Привязка сервиса обновлена $new_ip:$flask_port${RESET}"
     fi
 }
@@ -255,7 +256,7 @@ setup_https() {
     if [[ "$use_self_signed" == "true" ]]; then
         generate_self_signed_cert "$domain" "$server_ip"
     else
-        # ✅ ИЗМЕНЕННАЯ ЛОГИКА: Проверяем сертификат в $HTTPS_LE_DIR перед запросом нового
+        # Проверяем сертификат в $HTTPS_LE_DIR перед запросом нового
         if validate_existing_cert "$domain"; then
             echo -e "${GREEN}📋 Используем существующий валидный сертификат из $HTTPS_LE_DIR${RESET}"
             CERT_PATH="$HTTPS_LE_DIR/${domain}_fullchain.pem"
@@ -409,7 +410,7 @@ serverurl=unix:///var/run/supervisor.sock
 # Добавление main.py в Supervisor
 # ==========================================
 [program:gunicorn]
-command=gunicorn -w 4 main:app -b $GUNICORN_BIND
+command=gunicorn -w $WORKER_COUNT main:app -b $GUNICORN_BIND
 directory=$ROOT_DIR
 autostart=true
 autorestart=true
@@ -422,12 +423,27 @@ stderr_logfile_backups=5
 # Добавление Logs.py в Supervisor
 # ==========================================
 [program:logs]
-command=/bin/sh -c "sleep 30 && while true; do /usr/local/bin/python $ROOT_DIR/src/logs.py; sleep 30; done"
+command=/usr/local/bin/python $ROOT_DIR/src/logs.py
 directory=$ROOT_DIR/src
 autostart=true
 autorestart=true
 stdout_logfile=$LOGS_DIR/logs.stdout.log
 stderr_logfile=$LOGS_DIR/logs.stderr.log
+stdout_logfile_maxbytes=10MB
+stderr_logfile_maxbytes=10MB
+stdout_logfile_backups=5
+stderr_logfile_backups=5
+
+# ==========================================
+# Добавление wg_stats.py в Supervisor
+# ==========================================
+[program:wg_stats]
+command=/usr/local/bin/python $ROOT_DIR/src/wg_stats.py
+directory=$ROOT_DIR/src
+autostart=true
+autorestart=true
+stdout_logfile=$LOGS_DIR/wg_stats.stdout.log
+stderr_logfile=$LOGS_DIR/wg_stats.stderr.log
 stdout_logfile_maxbytes=10MB
 stderr_logfile_maxbytes=10MB
 stdout_logfile_backups=5
@@ -471,6 +487,7 @@ if [[ "$BOT_ON" =~ ^[Yy]$ ]]; then
 [program:telegram-bot]
 command=/usr/local/bin/python $ROOT_DIR/src/vpn_bot.py
 directory=$ROOT_DIR/src
+environment=MALLOC_ARENA_MAX="1",PYTHONMALLOC="malloc"
 autostart=true
 autorestart=true
 startretries=3
@@ -646,20 +663,93 @@ else
     echo "Файл $VNSTAT_CONF_FILE не найден."
 fi
 
+# Временно отключаем строгий режим для vnStat, чтобы ошибки не роняли скрипт
+set +e
+
 vnstatd --initdb 2>/dev/null || echo "vnstatd уже инициализирован"
 
-for iface in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1); do
-    if [[ "$iface" =~ ^(eth|ens) ]]; then
-        if ! vnstat --dbiflist 2>/dev/null | grep -qw "$iface"; then
-            echo "Интерфейс $iface не найден в vnStat. Добавляем..."
-            vnstat --add -i "$iface" && echo "Интерфейс $iface добавлен." || echo "Ошибка добавления $iface."
+# Функция безопасного добавления интерфейса и алиаса в vnStat
+add_vnstat_iface() {
+    local iface="$1"
+    local alias_name="$2"
+    
+    # Проверяем, есть ли интерфейс в БД
+    if ! vnstat --dbiflist 2>/dev/null | grep -qw "$iface"; then
+        echo -e "   ${GREEN}📡 Добавляю интерфейс $iface в vnStat...${RESET}"
+        if vnstat --add -i "$iface" 2>&1; then
+            echo -e "   ${GREEN}✅ Интерфейс $iface добавлен.${RESET}"
         else
-            echo "Интерфейс $iface уже существует в vnStat."
+            echo -e "   ${RED}❌ Ошибка добавления $iface. Проверьте права и состояние интерфейса.${RESET}"
+        fi
+    else
+        echo -e "   ${GREEN}ℹ️  Интерфейс $iface уже в vnStat.${RESET}"
+    fi
+    
+    # Устанавливаем алиас
+    if [[ -n "$alias_name" ]]; then
+        echo -e "   ${GREEN}🏷️  Устанавливаю алиас '$alias_name' для $iface...${RESET}"
+        if vnstat -i "$iface" --setalias "$alias_name" 2>&1; then
+            echo -e "   ${GREEN}✅ Алиас установлен.${RESET}"
+        else
+            echo -e "   ${RED}❌ Ошибка установки алиаса (возможно, старая версия vnstat < 2.10).${RESET}"
         fi
     fi
+}
+
+# 1. Добавляем физические интерфейсы (eth, ens)
+echo -e "${YELLOW}🔍 Поиск физических интерфейсов...${RESET}"
+for iface in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|ens)'); do
+    add_vnstat_iface "$iface" ""
 done
 
+# 2. Добавляем veth-интерфейсы контейнеров Amnezia/OpenVPN (УНИВЕРСАЛЬНАЯ ВЕРСИЯ)
+if command -v docker &> /dev/null; then
+    echo -e "${YELLOW}🐳 Сопоставление veth ↔ контейнеры Docker...${RESET}"
+    
+    # Временно отключаем строгий режим, чтобы ошибки одного контейнера не останавливали весь скрипт
+    set +e
+    
+    while IFS= read -r cname; do
+        [[ -z "$cname" ]] && continue
+        echo -e "   ${YELLOW}Обработка контейнера: $cname${RESET}"
+        
+        # 🔥 Используем docker exec для получения информации о сети
+        # Это работает и на хосте, и внутри контейнера (при наличии сокета)
+        eth0_info=$(docker exec "$cname" ip -o link show eth0 2>&1)
+        
+        if [[ $? -ne 0 ]] || [[ -z "$eth0_info" ]]; then
+            echo -e "   ${RED}⚠️  Не удалось получить данные сети (контейнер остановлен или нет прав).${RESET}"
+            continue
+        fi
+        
+        # Извлекаем Peer IfIndex (индекс veth на хосте)
+        # Вывод ip: "2: eth0@if162: <..." -> Нам нужно 162
+        peer_idx=$(echo "$eth0_info" | awk -F'@if' '{print $2}' | cut -d: -f1 | tr -d '[:space:]')
+        
+        if [[ -z "$peer_idx" ]] || [[ ! "$peer_idx" =~ ^[0-9]+$ ]]; then
+            echo -e "   ${RED}⚠️  Не найден интерфейс eth0 внутри контейнера.${RESET}"
+            continue
+        fi
+        
+        # Ищем на хосте интерфейс с этим индексом
+        # Вывод ip на хосте: "162: veth7e6688e@if2: ..."
+        veth_name=$(ip -o link show 2>/dev/null | awk -v idx="$peer_idx" '$1 == idx ":" {print $2}' | cut -d: -f1 | cut -d@ -f1)
+        
+        if [[ -n "$veth_name" ]]; then
+            add_vnstat_iface "$veth_name" "$cname"
+        else
+            echo -e "   ${RED}⚠️  Не найден veth-интерфейс с индексом $peer_idx.${RESET}"
+        fi
+        
+    done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei '(amnezia|openvpn-1)')
+    
+    # Возвращаем строгий режим
+    set -e
+else
+    echo -e "${YELLOW}⚠️  Docker не найден, пропускаем поиск veth-интерфейсов.${RESET}"
+fi
 service vnstat start 2>/dev/null || echo "Служба vnstat уже запущена"
+set -e
 
 # ==========================================
 # Завершение

@@ -8,6 +8,7 @@ let ovpnChart = null;
 let ovpnInterval = null;
 let ovpnCurrentPeriod = 'live'; // Текущий выбранный период
 const OVPN_LIVE_UPDATE_MS = 5000; // Обновление каждые 5 секунд
+const interfaceAliasMap = {}; // Хранилище соответствия: имя -> алиас
 
 // Форматирование скорости (бит/с → Кбит/с → Мбит/с)
 function formatSpeed(bps) {
@@ -278,7 +279,6 @@ function escapeHtml(text) {
 
 async function updateSystemInfo() {
     try {
-
         let basePath = window.basePath || '';
         if (!basePath) {
             const path = window.location.pathname;
@@ -288,25 +288,18 @@ async function updateSystemInfo() {
         }
         const response = await fetch(basePath + '/api/system_info');
         const data = await response.json();
+
+        // Обновляем только динамические данные (память, диск, загрузка сети)
         const memoryElement = document.getElementById('memory_used');
         const diskUsedDetail = document.getElementById('disk_used');
         const diskTotalDetail = document.getElementById('disk_total');
         const diskUsedKpi = document.getElementById('admin-kpi-disk-used');
         const diskTotalKpi = document.getElementById('admin-kpi-disk-total');
         const networkElement = document.getElementById('network_load');
-        const interfaceElement = document.getElementById('network_interface');
-        const rxElement = document.getElementById('rx_bytes');
-        const txElement = document.getElementById('tx_bytes');
-        const openvpn = data.vpn_clients?.OpenVPN ?? 0;
-        const wireguard = data.vpn_clients?.WireGuard ?? 0;
 
         if (memoryElement && memoryElement.textContent !== String(data.memory_used)) {
             memoryElement.textContent = data.memory_used;
         }
-
-        if (interfaceElement.textContent !== data.network_interface) interfaceElement.textContent = data.network_interface;
-        if (rxElement.textContent !== data.rx_bytes.toLocaleString()) rxElement.textContent = data.rx_bytes.toLocaleString();
-        if (txElement.textContent !== data.tx_bytes.toLocaleString()) txElement.textContent = data.tx_bytes.toLocaleString();
 
         const du = formatDiskGb(data.disk_used);
         const dt = formatDiskGb(data.disk_total);
@@ -315,33 +308,28 @@ async function updateSystemInfo() {
         if (diskUsedKpi && diskUsedKpi.textContent !== du) diskUsedKpi.textContent = du;
         if (diskTotalKpi && diskTotalKpi.textContent !== dt) diskTotalKpi.textContent = dt;
 
-        if (interfaceElement && interfaceElement.textContent !== data.network_interface) interfaceElement.textContent = data.network_interface;
-        const rxStr =
-            typeof data.rx_bytes === 'number'
-                ? data.rx_bytes.toLocaleString('ru-RU')
-                : String(data.rx_bytes ?? '');
-        const txStr =
-            typeof data.tx_bytes === 'number'
-                ? data.tx_bytes.toLocaleString('ru-RU')
-                : String(data.tx_bytes ?? '');
-        if (rxElement && rxElement.textContent !== rxStr) rxElement.textContent = rxStr;
-        if (txElement && txElement.textContent !== txStr) txElement.textContent = txStr;
-
         let networkHtml = '';
         for (const [iface, stats] of Object.entries(data.network_load)) {
-            networkHtml += `<p><b>${iface}</b>: Передача: ${stats.sent_speed} Мбит/с, Прием: ${stats.recv_speed} Мбит/с</p>`;
+            const ifaceAlias = getInterfaceAlias(iface);
+            networkHtml += `<p><b>${ifaceAlias}</b>: Передача: ${stats.sent_speed} Мбит/с, Прием: ${stats.recv_speed} Мбит/с</p>`;
         }
 
         if (networkElement && networkElement.innerHTML !== networkHtml) networkElement.innerHTML = networkHtml;
 
+        // Обновление KPI
         const elOvpn = document.getElementById('admin-stat-ovpn');
         const elWg = document.getElementById('admin-stat-wg');
         const elKpiCpu = document.getElementById('admin-kpi-cpu');
         const elKpiUptime = document.getElementById('admin-kpi-uptime');
+        const openvpn = data.vpn_clients?.OpenVPN ?? 0;
+        const wireguard = data.vpn_clients?.WireGuard ?? 0;
+
         if (elOvpn && elOvpn.textContent !== String(openvpn)) elOvpn.textContent = String(openvpn);
         if (elWg && elWg.textContent !== String(wireguard)) elWg.textContent = String(wireguard);
+        
         const cpuStr = formatCpuPercent(data.cpu_load);
         if (elKpiCpu && elKpiCpu.textContent !== cpuStr) elKpiCpu.textContent = cpuStr;
+        
         const cpuBar = document.getElementById('cpu_bar');
         const rawCpuNum = Number(data.cpu_load);
         setUtilMeter(cpuBar, Number.isFinite(rawCpuNum) ? rawCpuNum : 0);
@@ -349,18 +337,22 @@ async function updateSystemInfo() {
         const elRamPct = document.getElementById('admin-kpi-ram-pct');
         const elMemUsed = document.getElementById('admin-kpi-mem-used');
         const elMemTotal = document.getElementById('admin-kpi-mem-total');
+        
         let ramPct = data.memory_percent;
         if (ramPct == null && data.memory_total > 0) {
             ramPct = Math.round((100 * Number(data.memory_used)) / Number(data.memory_total) * 10) / 10;
         }
         const ramPctStr = ramPct == null ? '—' : formatCpuPercent(ramPct);
+        
         if (elRamPct && elRamPct.textContent !== ramPctStr) elRamPct.textContent = ramPctStr;
         if (elMemUsed && elMemUsed.textContent !== String(data.memory_used)) elMemUsed.textContent = data.memory_used;
         if (elMemTotal && data.memory_total != null && elMemTotal.textContent !== String(data.memory_total)) {
             elMemTotal.textContent = data.memory_total;
         }
+        
         const ramBar = document.getElementById('ram_bar');
         setUtilMeter(ramBar, ramPct == null || !Number.isFinite(Number(ramPct)) ? 0 : Number(ramPct));
+        
         if (elKpiUptime && elKpiUptime.textContent !== data.uptime) {
             elKpiUptime.textContent = data.uptime;
             elKpiUptime.setAttribute('title', data.uptime);
@@ -383,18 +375,36 @@ async function updateSystemInfo() {
 }
 
 // График vnstat
-let selectedIface = null;
+let selectedIfaceName = null;  // Реальное имя для API-запросов (требует vnstat)
+let selectedIfaceAlias = null; // Алиас для отображения в UI
 let selectedPeriod = 'day';
 let bwChartInstance = null;
 
-const ifaceDisplayNames = {
-    'antizapret-udp': 'OpenVPN | Antizapret UDP ',
-    'antizapret-tcp': 'OpenVPN | Antizapret TCP',
-    'vpn-udp': 'OpenVPN | VPN-UDP',
-    'vpn-tcp': 'OpenVPN | VPN-TCP',
-    'vpn': 'WireGuard | VPN',
-    'antizapret': 'WireGuard | Antizapret',
-};
+// Функция для получения алиаса интерфейса
+function getInterfaceAlias(ifaceName) {
+    if (!interfaceAliasMap || !ifaceName) return ifaceName;
+    return interfaceAliasMap[ifaceName] || ifaceName;
+}
+
+// Загрузка маппинга интерфейсов
+async function loadInterfaceAliases() {
+    try {
+        const basePath = window.basePath || '';
+        const res = await fetch(basePath + '/api/interfaces');
+        const data = await res.json();
+        
+        // Очищаем и заполняем маппинг
+        Object.keys(interfaceAliasMap).forEach(key => delete interfaceAliasMap[key]);
+        
+        data.interfaces.forEach(iface => {
+            const name = iface.name;
+            const alias = iface.alias || name;
+            interfaceAliasMap[name] = alias;
+        });
+    } catch (e) {
+        console.error('Ошибка при загрузке алиасов интерфейсов:', e);
+    }
+}
 
 async function loadInterfaces() {
     try {
@@ -403,44 +413,53 @@ async function loadInterfaces() {
         const data = await res.json();
         const container = document.getElementById('interface-filters');
         container.innerHTML = '';
+        // Очищаем глобальную карту перед новой загрузкой
+        Object.keys(interfaceAliasMap).forEach(key => delete interfaceAliasMap[key]);
 
         const defaultIfaces = ['eth0', 'enp3s0', 'ens33', 'wlan0'];
         let selectedByDefault = null;
 
         data.interfaces.forEach(iface => {
+            const name = iface.name;
+            const alias = iface.alias || name; // Если алиас не задан, fallback на имя
+            interfaceAliasMap[name] = alias;
+
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'btn btn-outline-secondary iface';
-            btn.dataset.iface = iface;
-            btn.textContent = iface;
-
-            btn.addEventListener('click', () => selectIface(iface, btn));
-
+            btn.dataset.name = name;
+            btn.textContent = alias; // Отображаем алиас, а не имя
+            btn.addEventListener('click', () => selectIface(name, btn));
             container.appendChild(btn);
 
-            if (!selectedByDefault && defaultIfaces.includes(iface)) {
-                selectedByDefault = { iface, btn };
+            if (!selectedByDefault && defaultIfaces.includes(name)) {
+                selectedByDefault = { name, btn };
             }
         });
 
         if (!selectedByDefault && data.interfaces.length > 0) {
-            selectedByDefault = { iface: data.interfaces[0], btn: container.children[0] };
+            selectedByDefault = { name: data.interfaces[0].name, btn: container.children[0] };
         }
 
         if (selectedByDefault) {
-            selectIface(selectedByDefault.iface, selectedByDefault.btn);
+            selectIface(selectedByDefault.name, selectedByDefault.btn);
         }
-
     } catch (e) {
         console.error('Ошибка при загрузке интерфейсов:', e);
     }
 }
 
-function selectIface(iface, btn) {
+function selectIface(name, btn) {
     document.querySelectorAll('.iface').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    selectedIface = iface;
-    document.getElementById('bwIface').textContent = ifaceDisplayNames[iface] || iface;
+
+    selectedIfaceName = name;
+    selectedIfaceAlias = interfaceAliasMap[name] || name;
+
+    // Обновляем заголовок над графиком
+    const ifaceTitleEl = document.getElementById('bwIface');
+    if (ifaceTitleEl) ifaceTitleEl.textContent = selectedIfaceAlias;
+
     updateGraph();
 }
 
@@ -461,13 +480,13 @@ function getThemeColors() {
 }
 
 async function updateGraph() {
-    if (!selectedIface) return;
+    if (!selectedIfaceName) return;
     const bwBox = document.getElementById('bwChartContainer');
     if (!bwBox || bwBox.style.display !== 'block') return;
 
     try {
         const basePath = window.basePath || '';
-        const res = await fetch(`${basePath}/api/bw?iface=${selectedIface}&period=${selectedPeriod}`);
+        const res = await fetch(`${basePath}/api/bw?iface=${selectedIfaceName}&period=${selectedPeriod}`);
         const data = await res.json();
         if (!data) return;
 
@@ -570,6 +589,43 @@ async function updateGraph() {
     }
 }
 
+
+// Загрузка месячного трафика для ВСЕХ интерфейсов
+async function loadAllMonthlyTraffic() {
+    try {
+        const basePath = window.basePath || '';
+        const res = await fetch(`${basePath}/api/bw/monthly_traffic`);
+        const data = await res.json();
+        
+        if (data.error) {
+            console.error("Ошибка API:", data.error);
+            return;
+        }
+        
+        // Обновляем RX (мес) для каждого интерфейса
+        document.querySelectorAll('.monthly-rx').forEach(el => {
+            const iface = el.dataset.iface;
+            if (data[iface]) {
+                el.textContent = data[iface].rx_human || '0 B';
+            } else {
+                el.textContent = '0 B';
+            }
+        });
+        
+        // Обновляем TX (мес) для каждого интерфейса
+        document.querySelectorAll('.monthly-tx').forEach(el => {
+            const iface = el.dataset.iface;
+            if (data[iface]) {
+                el.textContent = data[iface].tx_human || '0 B';
+            } else {
+                el.textContent = '0 B';
+            }
+        });      
+    } catch (e) {
+        console.error("Ошибка при загрузке месячного трафика:", e);
+    }
+}
+
 function toggleChartVisibility() {
     const chartContainer = document.getElementById('bwChartContainer');
     const toggleChartBtn = document.getElementById('toggleChartBtn');
@@ -609,6 +665,8 @@ function toggleChartVisibility() {
 
 // Инициализация после загрузки страницы
 document.addEventListener('DOMContentLoaded', () => {
+    // 🔹 Загружаем алиасы интерфейсов ПЕРВЫМ делом
+    loadInterfaceAliases();
     // Восстановление состояния CPU графика
     const cpuChartContainer = document.getElementById('cpuChartContainer');
     const toggleCpuChartBtn = document.getElementById('toggleCpuChartBtn');
@@ -781,6 +839,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     updateSystemInfo();
     setInterval(updateSystemInfo, 5000);
+    // ЗАГРУЗКА МЕСЯЧНОГО ТРАФИКА ПО ВСЕМ ИНТЕРФЕЙСАМ
+    setTimeout(() => {
+        loadAllMonthlyTraffic();
+    }, 250);
 });
 
 // Инициализация графика OpenVPN

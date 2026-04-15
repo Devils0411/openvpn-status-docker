@@ -33,7 +33,6 @@ COPY files/ /usr/share/easy-rsa/
 
 # Установка Python зависимостей
 RUN pip install --upgrade pip && pip install -r requirements.txt
-#RUN pip install -r requirements.txt
 
 # Сделать файлы в папках исполняемыми
 RUN chmod +x ./scripts/* && chmod +x ./src/*

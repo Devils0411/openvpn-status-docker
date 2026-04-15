@@ -14,6 +14,7 @@ import socket
 import subprocess
 import json
 import shutil
+import json
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -45,6 +46,7 @@ from src.config import Config
 from src.tg_bot.audit import log_action, get_logs, get_logs_count
 from flask_bcrypt import Bcrypt
 from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from zoneinfo._common import ZoneInfoNotFoundError
 from collections import OrderedDict, defaultdict
 from cryptography import x509
@@ -166,7 +168,6 @@ OVPN_DB_SAVE_INTERVAL = 300  # запись в БД каждые 5 минут
 ovpn_last_db_save = 0
 ovpn_stats_lock = Lock()
 ovpn_last_bytes = {}  # Для расчёта дельты
-
 
 
 BOT_RESTART_LOCK = Lock()
@@ -382,6 +383,45 @@ def parse_date_yyyy_mm_dd(raw_value):
         return datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
         return None
+
+def resolve_client_timezone():
+    tz_name = (request.args.get("tz") or "").strip()
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name), tz_name
+        except ZoneInfoNotFoundError:
+            pass
+
+    server_tz = get_localzone()
+    server_tz_name = getattr(server_tz, "key", None) or str(server_tz)
+    return server_tz, server_tz_name
+
+
+def _floor_to_hour(dt_value):
+    return dt_value.replace(minute=0, second=0, microsecond=0)
+
+
+def _ceil_to_hour(dt_value):
+    floored = _floor_to_hour(dt_value)
+    if dt_value == floored:
+        return floored
+    return floored + timedelta(hours=1)
+
+
+def get_server_hour_window_for_client_day(day_ymd, client_tz):
+    """Возвращает [start, end) в серверной зоне для клиентского дня."""
+    server_tz = get_localzone()
+    day_dt = datetime.strptime(day_ymd, "%Y-%m-%d")
+    start_client = day_dt.replace(tzinfo=client_tz)
+    end_client = start_client + timedelta(days=1)
+
+    start_server = _floor_to_hour(start_client.astimezone(server_tz))
+    end_server = _ceil_to_hour(end_client.astimezone(server_tz))
+
+    return (
+        start_server.strftime("%Y-%m-%d %H:00"),
+        end_server.strftime("%Y-%m-%d %H:00"),
+    )
 
 
 def read_admin_info():
@@ -1328,6 +1368,8 @@ def read_csv(file_path, config_protocol):
                         format_date(row[7]),
                         duration,
                         protocol,
+                        max(download_speed, 0),
+                        max(upload_speed, 0),
                     ]
                 )
 
@@ -1404,7 +1446,7 @@ def clear_openvpn_stats_database():
     try:
         _delete_tables_and_vacuum(
             app.config["LOGS_DATABASE_PATH"],
-            ("monthly_stats", "connection_logs", "last_client_stats"),
+            ("daily_stats", "monthly_stats", "years_stats", "connection_logs", "last_client_stats"),
         )
         return True, None
     except Exception as e:
@@ -1416,7 +1458,7 @@ def clear_wireguard_stats_database():
     try:
         _delete_tables_and_vacuum(
             app.config["WG_STATS_PATH"],
-            ("wg_daily_stats", "wg_intermediate", "wg_total_stats"),
+            ("wg_hourly_stats", "wg_daily_stats", "wg_monthly_stats", "wg_intermediate", "wg_total_stats"),
         )
         return True, None
     except Exception as e:
@@ -1525,18 +1567,29 @@ def get_default_interface():
 
 def get_network_stats(interface):
     try:
-        with open(
-            f"/sys/class/net/{interface}/statistics/rx_bytes", "r", encoding="utf-8"
-        ) as f:
+        with open(f"/sys/class/net/{interface}/statistics/rx_bytes", "r", encoding="utf-8") as f:
             rx_bytes = int(f.read().strip())
-        with open(
-            f"/sys/class/net/{interface}/statistics/tx_bytes", "r", encoding="utf-8"
-        ) as f:
+        with open(f"/sys/class/net/{interface}/statistics/tx_bytes", "r", encoding="utf-8") as f:
             tx_bytes = int(f.read().strip())
         return {"interface": interface, "rx": rx_bytes, "tx": tx_bytes}
     except FileNotFoundError:
-        logger.warning(f"⚠️ Интерфейс {interface} не найден")
-        return None  # Если интерфейс не найден
+        logger.warning(f"⚠️ Интерфейс {interface} не найден в /sys/class/net/. Удаляю из базы vnstat...")
+        try:          
+            result = subprocess.run(
+                ["/usr/bin/vnstat", "--remove", "-i", interface, "--force"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"✅ Интерфейс {interface} успешно удалён из базы vnstat")
+            else:
+                # vnstat вернёт ошибку, если интерфейс уже отсутствует в БД. Это нормально.
+                logger.debug(f"ℹ️ Ответ vnstat при удалении {interface}: {result.stderr.strip()}")                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при вызове vnstat для удаления {interface}: {e}")            
+        return None  # Интерфейс отсутствует или удалён
 
 
 def get_network_load():
@@ -1544,8 +1597,15 @@ def get_network_load():
     time.sleep(1)
     net_io_end = psutil.net_io_counters(pernic=True)
     network_data = {}
+    # Получаем алиасы интерфейсов
+    vnstat_interfaces = get_vnstat_interfaces()
+    alias_map = {iface['name']: iface['alias'] for iface in vnstat_interfaces}
     for interface in net_io_start:
-        if interface.startswith(("lo", "docker", "veth", "br-")):
+        # Получаем алиас интерфейса (если есть)
+        alias = alias_map.get(interface, interface)
+        # Проверяем, является ли интерфейс исключением (содержит amnezia или openvpn-1 в алиасе)
+        is_exception = ('amnezia' in alias.lower() or 'openvpn-1' in alias.lower())
+        if not is_exception and interface.startswith(("lo", "docker", "veth", "br-")):
             continue
 
         sent_start, recv_start = (
@@ -1821,12 +1881,31 @@ def update_system_info():
             if len(cpu_history) > MAX_CPU_HISTORY:
                 cpu_history.pop(0)  # удаляем старые записи
 
-            interface = get_default_interface()
-            network_stats = get_network_stats(interface) if interface else None
+            # =========================================================
+            # Сбор статистики по ВСЕМ интерфейсам
+            # =========================================================
+            vnstat_ifaces = get_vnstat_interfaces()
+            network_stats_dict = {}
+            
+            for iface_info in vnstat_ifaces:
+                iface_name = iface_info.get("name")
+                if iface_name:
+                    # Получаем статистику с uptime через get_network_stats
+                    stats = get_network_stats(iface_name)
+                    if stats:
+                        network_stats_dict[iface_name] = {
+                            "rx": format_bytes(stats["rx"]),
+                            "tx": format_bytes(stats["tx"]),
+                            "rx_bytes": stats["rx"],  # сохраняем в байтах для расчетов
+                            "tx_bytes": stats["tx"],
+                            "alias": iface_info.get("alias", iface_name)
+                        }
+
             vpn_clients = count_online_clients(LOG_FILES)
 
             _mem = psutil.virtual_memory()
             _disk = psutil.disk_usage("/")
+
             cached_system_info = {
                 **HOST_STATIC_INFO,
                 "cpu_load": round(cpu_percent, 1),
@@ -1837,9 +1916,8 @@ def update_system_info():
                 "disk_total": round(_disk.total / (1024**3), 1),
                 "network_load": get_network_load(),
                 "uptime": format_uptime(get_uptime()),
-                "network_interface": interface or "Не найдено",
-                "rx_bytes": format_bytes(network_stats["rx"]) if network_stats else 0,
-                "tx_bytes": format_bytes(network_stats["tx"]) if network_stats else 0,
+                # Полный словарь со статистикой по каждому интерфейсу
+                "network_interfaces": network_stats_dict,
                 "vpn_clients": vpn_clients,
             }
 
@@ -1940,14 +2018,17 @@ def get_vnstat_interfaces():
         interfaces = []
         for iface in data.get("interfaces", []):
             name = iface.get("name")
+            alias = iface.get("alias") or iface.get("description") or name
             traffic = iface.get("traffic", {}).get("total", {})
             rx = traffic.get("rx", 0)
             tx = traffic.get("tx", 0)
 
-            # Добавляем только если есть трафик
+            # Если трафик не нулевой
             if (rx + tx) > 0:
-                interfaces.append(name)
-
+                interfaces.append({"name": name, "alias": alias})
+                logger.debug(f"✅ Добавлен интерфейс vnstat: {name} (alias: {alias})")
+        
+        logger.info(f"📊 Найдено интерфейсов vnstat: {len(interfaces)}")
         return interfaces
 
     except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
@@ -2587,10 +2668,18 @@ def wg_stats():
     try:
         sort_by = request.args.get("sort", "client")
         order = request.args.get("order", "asc").lower()
-        period = request.args.get("period", "month")
-        now = datetime.now()
+        period = request.args.get("period", "day")
+        client_tz, selected_tz = resolve_client_timezone()
+        now = datetime.now(client_tz)
+        today = now.date()
         selected_date_from = (request.args.get("date_from") or "").strip()
         selected_date_to = (request.args.get("date_to") or "").strip()
+
+        def format_period_date(dt_value):
+            label = dt_value.strftime("%d.%m.%Y")
+            if dt_value.date() == today:
+                return f"{label} (сегодня)"
+            return label
 
         allowed_sorts = {
             "client": "client",
@@ -2603,17 +2692,30 @@ def wg_stats():
         if period == "day":
             date_from = now.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"за {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = date_from
+            interval_label = f"за {format_period_date(now)}"
         elif period == "week":
             week_start = now - timedelta(days=7)
             date_from = week_start.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"с {week_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = now.strftime("%Y-%m-%d")
+            interval_label = f"с {format_period_date(week_start)} по {format_period_date(now)}"
+        elif period == "month":
+            month_start = now - timedelta(days=30)
+            date_from = month_start.strftime("%Y-%m-%d")
+            date_to = None
+            selected_date_from = date_from
+            selected_date_to = now.strftime("%Y-%m-%d")
+            interval_label = f"с {format_period_date(month_start)} по {format_period_date(now)}"
         elif period == "year":
             year_start = now - timedelta(days=365)
             date_from = year_start.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"с {year_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = now.strftime("%Y-%m-%d")
+            interval_label = f"с {format_period_date(year_start)} по {format_period_date(now)}"
         elif period == "custom":
             date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
             date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
@@ -2624,30 +2726,74 @@ def wg_stats():
                 selected_date_to = date_to_dt.strftime("%Y-%m-%d")
                 date_from = selected_date_from
                 date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-                interval_label = f"с {date_from_dt.strftime('%d.%m.%Y')} по {date_to_dt.strftime('%d.%m.%Y')}"
+                if date_from_dt.date() == date_to_dt.date():
+                    interval_label = f"за {format_period_date(date_from_dt)}"
+                else:
+                    interval_label = f"с {format_period_date(date_from_dt)} по {format_period_date(date_to_dt)}"
             else:
-                period = "month"
-                date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+                period = "day"
+                date_from = now.strftime("%Y-%m-%d")
                 date_to = None
-                interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+                selected_date_from = date_from
+                selected_date_to = date_from
+                interval_label = f"за {format_period_date(now)}"
         else:
-            period = "month"
-            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            period = "day"
+            date_from = now.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = date_from
+            interval_label = f"за {format_period_date(now)}"
+
+        is_single_day = period == "day" or (
+            period == "custom"
+            and selected_date_from
+            and selected_date_from == selected_date_to
+        )
 
         stats_list = []
         total_received, total_sent = 0, 0
 
         with sqlite3.connect(app.config["WG_STATS_PATH"]) as conn:
-            if date_to:
+            if is_single_day:
+                target_date = date_from
+                start_hour, end_hour = get_server_hour_window_for_client_day(target_date, client_tz)
+                query = f"""
+                    SELECT client,
+                           SUM(received) as total_received,
+                           SUM(sent) as total_sent
+                    FROM wg_hourly_stats
+                    WHERE hour >= ? AND hour < ?
+                      AND interface != 'warp'
+                    GROUP BY client
+                    HAVING SUM(received) > 0 OR SUM(sent) > 0
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (start_hour, end_hour)).fetchall()
+            elif period == "year":
+                year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+                query = f"""
+                    SELECT client,
+                           SUM(received) as total_received,
+                           SUM(sent) as total_sent
+                    FROM wg_monthly_stats
+                    WHERE month >= ?
+                      AND interface != 'warp'
+                    GROUP BY client
+                    HAVING SUM(received) > 0 OR SUM(sent) > 0
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (year_month_from,)).fetchall()
+            elif date_to:
                 query = f"""
                     SELECT client,
                            SUM(received) as total_received,
                            SUM(sent) as total_sent
                     FROM wg_daily_stats
                     WHERE date >= ? AND date < ?
+                      AND interface != 'warp'
                     GROUP BY client
+                    HAVING SUM(received) > 0 OR SUM(sent) > 0
                     ORDER BY {sort_column} {order_sql}
                 """
                 rows = conn.execute(query, (date_from, date_to)).fetchall()
@@ -2658,7 +2804,9 @@ def wg_stats():
                            SUM(sent) as total_sent
                     FROM wg_daily_stats
                     WHERE date >= ?
+                      AND interface != 'warp'
                     GROUP BY client
+                    HAVING SUM(received) > 0 OR SUM(sent) > 0
                     ORDER BY {sort_column} {order_sql}
                 """
                 rows = conn.execute(query, (date_from,)).fetchall()
@@ -2674,6 +2822,8 @@ def wg_stats():
                         "client": client,
                         "total_received": format_bytes(received),
                         "total_sent": format_bytes(sent),
+                        "total_received_raw": received,
+                        "total_sent_raw": sent,
                     }
                 )
 
@@ -2689,6 +2839,7 @@ def wg_stats():
             order=order_sql.lower(),
             selected_date_from=selected_date_from,
             selected_date_to=selected_date_to,
+            selected_tz=selected_tz,
             interval_label=interval_label,
         )
 
@@ -2709,6 +2860,7 @@ def _collect_openvpn_clients_unsorted():
 
     online_clients_raw = []
     total_received, total_sent = 0, 0
+    total_download_speed_raw, total_upload_speed_raw = 0.0, 0.0
     errors = []
     online_client_names = set()
 
@@ -2723,6 +2875,8 @@ def _collect_openvpn_clients_unsorted():
             for client_row in file_data:
                 if client_row[0] != "UNDEF":
                     online_client_names.add(client_row[0])
+                    total_download_speed_raw += client_row[10]
+                    total_upload_speed_raw += client_row[11]
 
     all_clients = get_all_openvpn_clients()
     server_ip = get_external_ip()
@@ -2771,7 +2925,7 @@ def _collect_openvpn_clients_unsorted():
                 }
             )
 
-    return all_clients_list, total_received, total_sent, errors
+    return all_clients_list, total_received, total_sent, errors, total_download_speed_raw, total_upload_speed_raw
 
 
 def get_all_openvpn_clients():
@@ -2854,7 +3008,7 @@ def _dedupe_openvpn_client_status_rows(rows):
 def _build_openvpn_clients_sorted(sort_by, order):
     """Собирает список клиентов OpenVPN и сортирует. Возвращает
     (all_clients_list, total_received, total_sent, errors, total_online)."""
-    all_clients_list, total_received, total_sent, errors = (
+    all_clients_list, total_received, total_sent, errors, total_dl_speed, total_ul_speed = (
         _collect_openvpn_clients_unsorted()
     )
 
@@ -2899,7 +3053,7 @@ def _build_openvpn_clients_sorted(sort_by, order):
     total_online = len([c for c in all_clients_list if c["online"]])
     for c in all_clients_list:
         c["row_key"] = _ovpn_session_row_key(c["name"], c["protocol"])
-    return all_clients_list, total_received, total_sent, errors, total_online
+    return all_clients_list, total_received, total_sent, errors, total_online, total_dl_speed, total_ul_speed
 
 
 @app.route("/api/ovpn/clients")
@@ -2909,7 +3063,7 @@ def api_ovpn_clients():
     sort_by = request.args.get("sort", "client")
     order = request.args.get("order", "asc")
     try:
-        all_clients_list, total_received, total_sent, errors, total_online = (
+        all_clients_list, total_received, total_sent, errors, total_online, total_dl_speed, total_ul_speed = (
             _build_openvpn_clients_sorted(sort_by, order)
         )
         online = [c for c in all_clients_list if c["online"]]
@@ -2921,6 +3075,8 @@ def api_ovpn_clients():
                 "total_sent": format_bytes(total_sent),
                 "total_clients_str": pluralize_clients(total_online),
                 "total_online": total_online,
+                "total_download_speed": f"{format_bytes(total_dl_speed)}/s",
+                "total_upload_speed": f"{format_bytes(total_ul_speed)}/s",
                 "errors": errors,
             }
         )
@@ -2934,7 +3090,7 @@ def ovpn():
     try:
         sort_by = request.args.get("sort", "client")
         order = request.args.get("order", "asc")
-        all_clients_list, total_received, total_sent, errors, total_online = (
+        all_clients_list, total_received, total_sent, errors, total_online, total_dl_speed, total_ul_speed = (
             _build_openvpn_clients_sorted(sort_by, order)
         )
         return render_template(
@@ -2943,6 +3099,8 @@ def ovpn():
             total_clients_str=pluralize_clients(total_online),
             total_received=format_bytes(total_received),
             total_sent=format_bytes(total_sent),
+            total_download_speed=f"{format_bytes(total_dl_speed)}/s",
+            total_upload_speed=f"{format_bytes(total_ul_speed)}/s",
             active_section="ovpn",
             active_page="clients",
             errors=errors,
@@ -3039,10 +3197,18 @@ def ovpn_stats():
     try:
         sort_by = request.args.get("sort", "client_name")
         order = request.args.get("order", "asc").lower()
-        period = request.args.get("period", "month")
-        now = datetime.now()
+        period = request.args.get("period", "day")
+        client_tz, selected_tz = resolve_client_timezone()
+        now = datetime.now(client_tz)
+        today = now.date()
         selected_date_from = (request.args.get("date_from") or "").strip()
         selected_date_to = (request.args.get("date_to") or "").strip()
+
+        def format_period_date(dt_value):
+            label = dt_value.strftime("%d.%m.%Y")
+            if dt_value.date() == today:
+                return f"{label} (сегодня)"
+            return label
 
         allowed_sorts = {
             "client_name": "client_name",
@@ -3056,17 +3222,30 @@ def ovpn_stats():
         if period == "day":
             date_from = now.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"за {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = date_from
+            interval_label = f"за {format_period_date(now)}"
         elif period == "week":
             week_start = now - timedelta(days=7)
             date_from = week_start.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"с {week_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = now.strftime("%Y-%m-%d")
+            interval_label = f"с {format_period_date(week_start)} по {format_period_date(now)}"
+        elif period == "month":
+            month_start = now - timedelta(days=30)
+            date_from = month_start.strftime("%Y-%m-%d")
+            date_to = None
+            selected_date_from = date_from
+            selected_date_to = now.strftime("%Y-%m-%d")
+            interval_label = f"с {format_period_date(month_start)} по {format_period_date(now)}"
         elif period == "year":
             year_start = now - timedelta(days=365)
             date_from = year_start.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"с {year_start.strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = now.strftime("%Y-%m-%d")
+            interval_label = f"с {format_period_date(year_start)} по {format_period_date(now)}"
         elif period == "custom":
             date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
             date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
@@ -3077,23 +3256,63 @@ def ovpn_stats():
                 selected_date_to = date_to_dt.strftime("%Y-%m-%d")
                 date_from = selected_date_from
                 date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-                interval_label = f"с {date_from_dt.strftime('%d.%m.%Y')} по {date_to_dt.strftime('%d.%m.%Y')}"
+                if date_from_dt.date() == date_to_dt.date():
+                    interval_label = f"за {format_period_date(date_from_dt)}"
+                else:
+                    interval_label = f"с {format_period_date(date_from_dt)} по {format_period_date(date_to_dt)}"
             else:
-                period = "month"
-                date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+                period = "day"
+                date_from = now.strftime("%Y-%m-%d")
                 date_to = None
-                interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+                selected_date_from = date_from
+                selected_date_to = date_from
+                interval_label = f"за {format_period_date(now)}"
         else:
-            period = "month"
-            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            period = "day"
+            date_from = now.strftime("%Y-%m-%d")
             date_to = None
-            interval_label = f"с {(now - timedelta(days=30)).strftime('%d.%m.%Y')} по {now.strftime('%d.%m.%Y')}"
+            selected_date_from = date_from
+            selected_date_to = date_from
+            interval_label = f"за {format_period_date(now)}"
+
+        is_single_day = period == "day" or (
+            period == "custom"
+            and selected_date_from
+            and selected_date_from == selected_date_to
+        )
 
         stats_list = []
         total_received, total_sent = 0, 0
 
         with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-            if date_to:
+            if is_single_day:
+                target_date = date_from
+                start_hour, end_hour = get_server_hour_window_for_client_day(target_date, client_tz)
+                query = f"""
+                    SELECT client_name,
+                           SUM(total_bytes_sent),
+                           SUM(total_bytes_received),
+                           MAX(last_connected)
+                    FROM daily_stats
+                    WHERE hour >= ? AND hour < ?
+                    GROUP BY client_name
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (start_hour, end_hour)).fetchall()
+            elif period == "year":
+                year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+                query = f"""
+                    SELECT client_name,
+                           SUM(total_bytes_sent),
+                           SUM(total_bytes_received),
+                           MAX(last_connected)
+                    FROM years_stats
+                    WHERE month >= ?
+                    GROUP BY client_name
+                    ORDER BY {sort_column} {order_sql}
+                """
+                rows = conn.execute(query, (year_month_from,)).fetchall()
+            elif date_to:
                 query = f"""
                     SELECT client_name,
                            SUM(total_bytes_sent),
@@ -3126,6 +3345,8 @@ def ovpn_stats():
                         "client_name": client_name,
                         "total_bytes_sent": format_bytes(received),
                         "total_bytes_received": format_bytes(sent),
+                        "total_bytes_sent_raw": received or 0,
+                        "total_bytes_received_raw": sent or 0,
                         "last_connected": last_connected,
                     }
                 )
@@ -3142,6 +3363,7 @@ def ovpn_stats():
             order=order_sql.lower(),
             selected_date_from=selected_date_from,
             selected_date_to=selected_date_to,
+            selected_tz=selected_tz,
             interval_label=interval_label,
         )
 
@@ -3159,40 +3381,109 @@ def ovpn_stats():
 @login_required
 def api_ovpn_client_chart():
     client_name = request.args.get("client")
-    period = request.args.get("period", "month")
-    now = datetime.now()
+    period = request.args.get("period", "day")
+    client_tz, _ = resolve_client_timezone()
+    now = datetime.now(client_tz)
     selected_date_from = (request.args.get("date_from") or "").strip()
     selected_date_to = (request.args.get("date_to") or "").strip()
     if not client_name:
         return jsonify({"error": "client parameter required"}), 400
 
+    is_single_day = False
+
     if period == "day":
-        date_from = now.strftime("%Y-%m-%d")
-        date_to = None
+        target_date = now.strftime("%Y-%m-%d")
+        selected_date_from = target_date
+        selected_date_to = target_date
+        is_single_day = True
     elif period == "week":
         date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
         date_to = None
-    elif period == "year":
-        date_from = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+    elif period == "month":
+        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
         date_to = None
+    elif period == "year":
+        year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
     elif period == "custom":
         date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
         date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
         if date_from_dt and date_to_dt:
             if date_from_dt > date_to_dt:
                 date_from_dt, date_to_dt = date_to_dt, date_from_dt
-            date_from = date_from_dt.strftime("%Y-%m-%d")
-            date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            if date_from_dt == date_to_dt:
+                target_date = date_from_dt.strftime("%Y-%m-%d")
+                selected_date_from = target_date
+                selected_date_to = target_date
+                is_single_day = True
+            else:
+                date_from = date_from_dt.strftime("%Y-%m-%d")
+                date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
-            date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
-            date_to = None
+            target_date = now.strftime("%Y-%m-%d")
+            selected_date_from = target_date
+            selected_date_to = target_date
+            is_single_day = True
     else:
-        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
-        date_to = None
+        target_date = now.strftime("%Y-%m-%d")
+        selected_date_from = target_date
+        selected_date_to = target_date
+        is_single_day = True
 
     try:
         with sqlite3.connect(app.config["LOGS_DATABASE_PATH"]) as conn:
-            if date_to:
+            if is_single_day:
+                start_hour, end_hour = get_server_hour_window_for_client_day(target_date, client_tz)
+                rows = conn.execute(
+                    """
+                    SELECT hour,
+                           SUM(total_bytes_received) as rx,
+                           SUM(total_bytes_sent) as tx
+                    FROM daily_stats
+                    WHERE client_name = ? AND hour >= ? AND hour < ?
+                    GROUP BY hour
+                    ORDER BY hour ASC
+                    """,
+                    (client_name, start_hour, end_hour),
+                ).fetchall()
+                hour_data = {h: (rx or 0, tx or 0) for h, rx, tx in rows}
+                day_start_client = datetime.strptime(target_date, "%Y-%m-%d").replace(
+                    tzinfo=client_tz
+                )
+                day_end_client = day_start_client + timedelta(days=1)
+                now_hour_client = now.replace(minute=0, second=0, microsecond=0) + timedelta(
+                    hours=1
+                )
+                display_end_client = min(day_end_client, now_hour_client)
+                labels = []
+                rx_data = []
+                tx_data = []
+
+                point_dt_client = day_start_client
+                while point_dt_client < display_end_client:
+                    point_dt_server = point_dt_client.astimezone(get_localzone())
+                    server_hour_key = point_dt_server.strftime("%Y-%m-%d %H:00")
+                    labels.append(point_dt_client.strftime("%Y-%m-%d %H:00"))
+                    rx, tx = hour_data.get(server_hour_key, (0, 0))
+                    rx_data.append(rx or 0)
+                    tx_data.append(tx or 0)
+                    point_dt_client += timedelta(hours=1)
+            elif period == "year":
+                rows = conn.execute(
+                    """
+                    SELECT month,
+                           SUM(total_bytes_received) as rx,
+                           SUM(total_bytes_sent) as tx
+                    FROM years_stats
+                    WHERE client_name = ? AND month >= ?
+                    GROUP BY month
+                    ORDER BY month ASC
+                    """,
+                    (client_name, year_month_from),
+                ).fetchall()
+                labels = [r[0] for r in rows]
+                rx_data = [r[1] or 0 for r in rows]
+                tx_data = [r[2] or 0 for r in rows]
+            elif date_to:
                 rows = conn.execute(
                     """
                     SELECT month,
@@ -3205,6 +3496,9 @@ def api_ovpn_client_chart():
                     """,
                     (client_name, date_from, date_to),
                 ).fetchall()
+                labels = [r[0] for r in rows]
+                rx_data = [r[1] or 0 for r in rows]
+                tx_data = [r[2] or 0 for r in rows]
             else:
                 rows = conn.execute(
                     """
@@ -3218,14 +3512,9 @@ def api_ovpn_client_chart():
                     """,
                     (client_name, date_from),
                 ).fetchall()
-
-        labels = []
-        rx_data = []
-        tx_data = []
-        for month_val, rx, tx in rows:
-            labels.append(month_val)
-            rx_data.append(rx or 0)
-            tx_data.append(tx or 0)
+                labels = [r[0] for r in rows]
+                rx_data = [r[1] or 0 for r in rows]
+                tx_data = [r[2] or 0 for r in rows]
 
         return jsonify({
             "client": client_name,
@@ -3241,41 +3530,144 @@ def api_ovpn_client_chart():
 @login_required
 def api_wg_client_chart():
     client_name = request.args.get("client")
-    period = request.args.get("period", "month")
-    
+    period = request.args.get("period", "day")
+    client_tz, _ = resolve_client_timezone()
+    now = datetime.now(client_tz)
+    selected_date_from = (request.args.get("date_from") or "").strip()
+    selected_date_to = (request.args.get("date_to") or "").strip()
     if not client_name:
         return jsonify({"error": "client parameter required"}), 400
-    
-    now = datetime.now()
+
+    is_single_day = False
+
     if period == "day":
-        date_from = now.strftime("%Y-%m-%d")
+        target_date = now.strftime("%Y-%m-%d")
+        selected_date_from = target_date
+        selected_date_to = target_date
+        is_single_day = True
+    elif period == "week":
+        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        date_to = None
     elif period == "month":
-        date_from = now.replace(day=1).strftime("%Y-%m-%d")
+        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        date_to = None
     elif period == "year":
-        date_from = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+        year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+    elif period == "custom":
+        date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
+        date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
+        if date_from_dt and date_to_dt:
+            if date_from_dt > date_to_dt:
+                date_from_dt, date_to_dt = date_to_dt, date_from_dt
+            if date_from_dt == date_to_dt:
+                target_date = date_from_dt.strftime("%Y-%m-%d")
+                selected_date_from = target_date
+                selected_date_to = target_date
+                is_single_day = True
+            else:
+                date_from = date_from_dt.strftime("%Y-%m-%d")
+                date_to = (date_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            target_date = now.strftime("%Y-%m-%d")
+            selected_date_from = target_date
+            selected_date_to = target_date
+            is_single_day = True
     else:
-        date_from = now.replace(day=1).strftime("%Y-%m-%d")
-    
+        target_date = now.strftime("%Y-%m-%d")
+        selected_date_from = target_date
+        selected_date_to = target_date
+        is_single_day = True
+
     try:
         with sqlite3.connect(app.config["WG_STATS_PATH"]) as conn:
-            rows = conn.execute(
-                """SELECT date,
-                          SUM(received) as rx,
-                          SUM(sent) as tx
-                   FROM wg_daily_stats
-                   WHERE client = ? AND date >= ?
-                   GROUP BY date
-                   ORDER BY date ASC""",
-                (client_name, date_from),
-            ).fetchall()
-        
-        labels = []
-        rx_data = []
-        tx_data = []
-        for date_val, rx, tx in rows:
-            labels.append(date_val)
-            rx_data.append(rx or 0)
-            tx_data.append(tx or 0)
+            if is_single_day:
+                start_hour, end_hour = get_server_hour_window_for_client_day(target_date, client_tz)
+                rows = conn.execute(
+                    """
+                    SELECT hour,
+                           SUM(received) as rx,
+                           SUM(sent) as tx
+                    FROM wg_hourly_stats
+                    WHERE client = ? AND hour >= ? AND hour < ?
+                      AND interface != 'warp'
+                    GROUP BY hour
+                    ORDER BY hour ASC
+                    """,
+                    (client_name, start_hour, end_hour),
+                ).fetchall()
+                hour_data = {h: (rx or 0, tx or 0) for h, rx, tx in rows}
+                day_start_client = datetime.strptime(target_date, "%Y-%m-%d").replace(
+                    tzinfo=client_tz
+                )
+                day_end_client = day_start_client + timedelta(days=1)
+                now_hour_client = now.replace(minute=0, second=0, microsecond=0) + timedelta(
+                    hours=1
+                )
+                display_end_client = min(day_end_client, now_hour_client)
+                labels = []
+                rx_data = []
+                tx_data = []
+
+                point_dt_client = day_start_client
+                while point_dt_client < display_end_client:
+                    point_dt_server = point_dt_client.astimezone(get_localzone())
+                    server_hour_key = point_dt_server.strftime("%Y-%m-%d %H:00")
+                    labels.append(point_dt_client.strftime("%Y-%m-%d %H:00"))
+                    rx, tx = hour_data.get(server_hour_key, (0, 0))
+                    rx_data.append(rx or 0)
+                    tx_data.append(tx or 0)
+                    point_dt_client += timedelta(hours=1)
+            elif period == "year":
+                rows = conn.execute(
+                    """
+                    SELECT month,
+                           SUM(received) as rx,
+                           SUM(sent) as tx
+                    FROM wg_monthly_stats
+                    WHERE client = ? AND month >= ?
+                      AND interface != 'warp'
+                    GROUP BY month
+                    ORDER BY month ASC
+                    """,
+                    (client_name, year_month_from),
+                ).fetchall()
+                labels = [r[0] for r in rows]
+                rx_data = [r[1] or 0 for r in rows]
+                tx_data = [r[2] or 0 for r in rows]
+            elif date_to:
+                rows = conn.execute(
+                    """
+                    SELECT date,
+                           SUM(received) as rx,
+                           SUM(sent) as tx
+                    FROM wg_daily_stats
+                    WHERE client = ? AND date >= ? AND date < ?
+                      AND interface != 'warp'
+                    GROUP BY date
+                    ORDER BY date ASC
+                    """,
+                    (client_name, date_from, date_to),
+                ).fetchall()
+                labels = [r[0] for r in rows]
+                rx_data = [r[1] or 0 for r in rows]
+                tx_data = [r[2] or 0 for r in rows]
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT date,
+                           SUM(received) as rx,
+                           SUM(sent) as tx
+                    FROM wg_daily_stats
+                    WHERE client = ? AND date >= ?
+                      AND interface != 'warp'
+                    GROUP BY date
+                    ORDER BY date ASC
+                    """,
+                    (client_name, date_from),
+                ).fetchall()
+                labels = [r[0] for r in rows]
+                rx_data = [r[1] or 0 for r in rows]
+                tx_data = [r[2] or 0 for r in rows]
         
         logger.debug(f"📊 График WireGuard клиента {client_name}")
         return jsonify({
@@ -3321,12 +3713,16 @@ def api_bw():
         points = 12
         interval_seconds = 300
     elif period == "day":
-        vnstat_option = "h"
+        vnstat_option = "h"  # по часам
         points = 24
         interval_seconds = 3600
+    elif period == "week":
+        vnstat_option = "d"
+        points = 7
+        interval_seconds = 86400
     elif period == "month":
         vnstat_option = "d"
-        points = now.day
+        points = 30
         interval_seconds = 86400
     else:
         vnstat_option = "h"
@@ -3427,6 +3823,144 @@ def api_bw():
             "server_time": server_time_utc,
         }
     )
+
+
+@app.route("/api/bw/monthly_traffic")
+@login_required
+def api_monthly_traffic():
+    """Возвращает накопленный трафик за текущий календарный месяц.
+    Если iface не указан - возвращает данные по ВСЕМ интерфейсам.
+    """
+    iface = request.args.get("iface")
+    vnstat_bin = os.environ.get("VNSTAT_BIN", "/usr/bin/vnstat")
+    
+    # Получаем список всех интерфейсов
+    try:
+        proc = subprocess.run(
+            [vnstat_bin, "--json"], check=True, capture_output=True, text=True
+        )
+        data = json.loads(proc.stdout)
+        all_interfaces = [iface["name"] for iface in data.get("interfaces", [])]
+        
+        # Фильтруем только интерфейсы с трафиком
+        vnstat_ifaces = get_vnstat_interfaces()
+        all_interfaces = [iface_info["name"] for iface_info in vnstat_ifaces]
+        
+        if not all_interfaces:
+            return jsonify({"error": "Нет интерфейсов vnstat"}), 500
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения интерфейсов: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    # Если указан конкретный интерфейс - возвращаем только его (для обратной совместимости)
+    if iface:
+        if iface not in all_interfaces:
+            return jsonify({"error": f"Интерфейс {iface} не найден"}), 404
+            
+        monthly_stats = {}
+        try:
+            proc = subprocess.run(
+                [vnstat_bin, "--json", "m", "-i", iface],
+                check=True, capture_output=True, text=True,
+            )
+            data = json.loads(proc.stdout)
+            
+            for it in data.get("interfaces", []):
+                if it.get("name") == iface:
+                    traffic = it.get("traffic") or {}
+                    monthly_data = traffic.get("month") or []
+                    
+                    now = datetime.now()
+                    current_year = now.year
+                    current_month = now.month
+                    
+                    current_month_data = None
+                    for month_entry in monthly_data:
+                        date_info = month_entry.get("date", {})
+                        year = date_info.get("year", 0)
+                        month = date_info.get("month", 0)
+                        
+                        if year == current_year and month == current_month:
+                            current_month_data = month_entry
+                            break
+                    
+                    rx_bytes = int(current_month_data.get("rx", 0)) if current_month_data else 0
+                    tx_bytes = int(current_month_data.get("tx", 0)) if current_month_data else 0
+                    
+                    # Получаем алиас интерфейса
+                    alias = next((inf["alias"] for inf in vnstat_ifaces if inf["name"] == iface), iface)
+                    
+                    monthly_stats[iface] = {
+                        "alias": alias,
+                        "rx_bytes": rx_bytes,
+                        "tx_bytes": tx_bytes,
+                        "rx_human": format_bytes(rx_bytes),
+                        "tx_human": format_bytes(tx_bytes)
+                    }
+                    break
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения месячных данных для {iface}: {e}")
+            return jsonify({"error": str(e)}), 500
+            
+        return jsonify(monthly_stats)
+    
+    # Если iface не указан - возвращаем данные по ВСЕМ интерфейсам
+    monthly_stats = {}
+    
+    for iface_name in all_interfaces:
+        try:
+            proc = subprocess.run(
+                [vnstat_bin, "--json", "m", "-i", iface_name],
+                check=True, capture_output=True, text=True,
+            )
+            data = json.loads(proc.stdout)
+            
+            for it in data.get("interfaces", []):
+                if it.get("name") == iface_name:
+                    traffic = it.get("traffic") or {}
+                    monthly_data = traffic.get("month") or []
+                    
+                    now = datetime.now()
+                    current_year = now.year
+                    current_month = now.month
+                    
+                    current_month_data = None
+                    for month_entry in monthly_data:
+                        date_info = month_entry.get("date", {})
+                        year = date_info.get("year", 0)
+                        month = date_info.get("month", 0)
+                        
+                        if year == current_year and month == current_month:
+                            current_month_data = month_entry
+                            break
+                    
+                    rx_bytes = int(current_month_data.get("rx", 0)) if current_month_data else 0
+                    tx_bytes = int(current_month_data.get("tx", 0)) if current_month_data else 0
+                    
+                    # Получаем алиас интерфейса
+                    alias = next((inf["alias"] for inf in vnstat_ifaces if inf["name"] == iface_name), iface_name)
+                    
+                    monthly_stats[iface_name] = {
+                        "alias": alias,
+                        "rx_bytes": rx_bytes,
+                        "tx_bytes": tx_bytes,
+                        "rx_human": format_bytes(rx_bytes),
+                        "tx_human": format_bytes(tx_bytes)
+                    }
+                    break
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения месячных данных для {iface_name}: {e}")
+            monthly_stats[iface_name] = {
+                "alias": iface_name,
+                "rx_bytes": 0,
+                "tx_bytes": 0,
+                "rx_human": "0 B",
+                "tx_human": "0 B"
+            }
+    
+    return jsonify(monthly_stats)
 
 
 @app.route("/api/interfaces")

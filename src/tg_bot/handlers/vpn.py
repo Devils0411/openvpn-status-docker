@@ -42,6 +42,47 @@ async def _get_bot():
     return get_bot()
 
 
+async def send_amnezia_config(chat_id: int, client_name: str, client_id: str = None) -> bool:
+    """Скачивает конфиг AmneziaWG по имени/ID и отправляет его пользователю."""
+    from src.tg_bot.bot import get_amnezia_client
+    amnezia = await get_amnezia_client()
+    if not amnezia:
+        logger.error("❌ Amnezia клиент не инициализирован")
+        return False
+
+    try:
+        # Если ID не передан, ищем клиента по имени
+        if not client_id:
+            clients = await amnezia.get_clients()
+            client = next((c for c in clients if c.get("name") == client_name), None)
+            if not client:
+                raise RuntimeError(f"Клиент {client_name} не найден в AmneziaWG")
+            client_id = str(client["id"])
+
+        config_content = await amnezia.download_config(client_id)
+
+        import tempfile
+        from aiogram.types import FSInputFile
+        with tempfile.NamedTemporaryFile(suffix=".conf", delete=False) as tmp:
+            tmp.write(config_content)
+            tmp_path = tmp.name
+
+        try:
+            bot = await _get_bot()
+            await bot.send_document(
+                chat_id,
+                document=FSInputFile(tmp_path, filename=f"{client_name}.conf"),
+                caption=f"🔐 Конфигурация для {client_name}"
+            )
+            return True
+        finally:
+            os.unlink(tmp_path)
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки конфига {client_name}: {e}", exc_info=True)
+        return False
+
+
 @router.callback_query(lambda c: c.data.startswith("client_"))
 async def handle_client_selection(callback: types.CallbackQuery, state: FSMContext):
     """Обработка выбора клиента для скачивания конфига."""
@@ -57,24 +98,19 @@ async def handle_client_selection(callback: types.CallbackQuery, state: FSMConte
             return
 
     await state.update_data(client_mode=True, client_name=client_name, vpn_type=vpn_type)
-    
-    back_callback = (
-        "back_to_client_menu"
-        if callback.from_user.id not in admin_ids
-        else "back_to_client_list"
-    )
-    
+
     if vpn_type == "openvpn":
         await callback.answer("⏳ Генерация конфигурации...")
         await send_config(callback.from_user.id, client_name, "1")
-#    else:
-#        await callback.message.edit_text(
-#            "Выберите тип конфигурации WireGuard:",
-#            reply_markup=create_wireguard_config_menu(client_name, back_callback),
-#        )
-#        await state.set_state(VPNSetup.choosing_config_type)
-    
-    await callback.answer()
+        await callback.answer()
+    else:
+        # WireGuard: прямая отправка через общую функцию
+        await callback.answer("⏳ Подготовка конфига...")
+        if await send_amnezia_config(callback.from_user.id, client_name):
+            await callback.message.edit_text(f"✅ Конфиг для {client_name} отправлен!")
+        else:
+            await callback.message.answer(f"❌ Не удалось получить конфиг для {client_name}")
+        await callback.answer()
 
 
 @router.callback_query(VPNSetup.entering_days, lambda c: c.data == "skip_expire")
@@ -404,19 +440,56 @@ async def handle_client_name(message: types.Message, state: FSMContext):
         await state.update_data(client_name=client_name)
         await message.answer("Введите срок действия сертификата в днях (по умолчанию 1825 дней = 5 лет):\n Например: 365 (1 год), 730 (2 года), 1825 (5 лет)")
         await state.set_state(VPNSetup.entering_days)
+    elif option == "4":
+        from src.tg_bot.bot import get_amnezia_client
+        amnezia = await get_amnezia_client()
+        
+        if not amnezia:
+            logger.error("❌ Amnezia клиент не инициализирован")
+            await message.answer("❌ Ошибка: подключение к AmneziaWG недоступно")
+            await state.clear()
+            return
+        
+        try:
+            # 1. Создаём клиента
+            result = await amnezia.create_client(client_name)
+            client_id = result.get("id")
+            
+            # Fallback: если API не вернул ID сразу, ищем по имени
+            if not client_id:
+                clients = await amnezia.get_clients()
+                client = next((c for c in clients if c.get("name") == client_name), None)
+                if client:
+                    client_id = client.get("id")
+            
+            if not client_id:
+                raise RuntimeError("Не получен ID клиента")
+            
+            # 2. Отправляем конфиг через общую функцию
+            if await send_amnezia_config(message.chat.id, client_name, client_id):
+                server_ip = _get_server_ip()
+                await message.answer(
+                    f"✅ Клиент {client_name} создан в AmneziaWG!",
+                    reply_markup=create_main_menu(server_ip)
+                )
+                log_action("bot", message.from_user.id, message.from_user.full_name,
+                          "client_create", f"{client_name} (amnezia-wg)")
+                await notify_admins(message.from_user.id, message.from_user.full_name,
+                                   f"создал клиента <b>{client_name}</b> (AmneziaWG)")
+                logger.info("✅ Клиент %s создан через AmneziaWG API", client_name)
+            else:
+                await message.answer("❌ Ошибка при генерации конфигурации")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания клиента через Amnezia: {e}", exc_info=True)
+            await message.answer(f"❌ Ошибка: {str(e)}")
+        finally:
+            await state.clear()
+    
     else:
-        result = await execute_script(option, client_name)
-        if result["returncode"] == 0:
-            await send_config(message.chat.id, client_name, option)
-            server_ip = _get_server_ip()
-            await message.answer("✅ Клиент создан!", reply_markup=create_main_menu(server_ip))
-            vpn_type = "wireguard" if option == "4" else "openvpn"
-            log_action("bot", message.from_user.id, message.from_user.full_name, "client_create", f"{client_name} ({vpn_type})")
-            await notify_admins(message.from_user.id, message.from_user.full_name, f"создал клиента <b>{client_name}</b> ({vpn_type})")
-            logger.info("✅ Клиент %s создан (%s)", client_name, vpn_type)
-        else:
-            logger.error("❌ Ошибка создания клиента %s: %s", client_name, result['stderr'])
-            await message.answer(f"❌ Ошибка: {result['stderr']}")
+        # Неизвестная опция
+        logger.warning("⚠️ Неизвестная опция создания: %s", option)
+        await message.answer("❌ Неизвестная операция")
         await state.clear()
 
 

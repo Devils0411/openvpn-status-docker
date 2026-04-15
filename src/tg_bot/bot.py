@@ -4,11 +4,44 @@ import asyncio
 import time
 import datetime
 import logging
+from typing import Optional, Dict
 from src.config import Config
+from .amnezia_client import AmneziaClient, AmneziaContainerFinder
+# Глобальные переменные для AmneziaWG
+_amnezia_client: Optional[AmneziaClient] = None
+_amnezia_config: Dict[str, str] = {}  # {"ip": "...", "password": "..."}
 logger = logging.getLogger("tg_bot")
 
 _bot = None
 _dp = None
+
+
+async def init_amnezia_connection():
+    """Инициализировать подключение к AmneziaWG Easy при старте бота."""
+    global _amnezia_client, _amnezia_config
+    
+    logger.info("🔍 Поиск контейнера AmneziaWG...")
+    result = AmneziaContainerFinder.discover()
+    
+    if not result:
+        logger.warning("⚠️ AmneziaWG контейнер не найден, функция создания клиентов будет недоступна")
+        return
+        
+    ip, password = result
+    base_url = f"http://{ip}:51821"
+    
+    try:
+        _amnezia_config = {"ip": ip, "password": password, "base_url": base_url}
+        _amnezia_client = AmneziaClient(base_url, password)
+        await _amnezia_client.__aenter__()  # Выполнить логин
+        logger.info(f"✅ Подключение к AmneziaWG Easy установлено: {base_url}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к AmneziaWG API: {e}")
+        _amnezia_client = None
+
+async def get_amnezia_client() -> Optional[AmneziaClient]:
+    """Получить активный клиент AmneziaWG."""
+    return _amnezia_client
 
 
 def get_bot():
@@ -216,47 +249,56 @@ async def monitor_server_load():
     )
     from .admin import is_admin_notification_enabled, is_admin_load_notification_enabled
     from .utils import get_color_by_percent
-
-    logger.info("📊 Задача мониторинга нагрузки запущена")
     
-    while True:
-        await asyncio.sleep(LOAD_CHECK_INTERVAL)
-        admin_ids = get_admin_ids()
-        
-        if not admin_ids:
-            continue
-        
-        cpu_threshold, memory_threshold = get_load_thresholds()
-        
-        is_sustained, avg_cpu, avg_ram = await asyncio.to_thread(
-            _check_sustained_high_load, cpu_threshold, memory_threshold
-        )
-        
-        if not is_sustained:
-            continue
+    logger.info("📊 Задача мониторинга нагрузки запущена")
 
-        logger.warning(f"⚠️ Высокая нагрузка: CPU={avg_cpu:.1f}%, RAM={avg_ram:.1f}%")
-        
-        now_ts = time.time()
-        alert_text = (
-            "<b>⚠️ Высокая нагрузка на сервер</b>\n"
-            "<i>(держится более 5 минут)</i>\n\n"
-            f"{get_color_by_percent(avg_cpu)} <b>ЦП:</b> {avg_cpu:>5.1f}%\n"
-            f"{get_color_by_percent(avg_ram)} <b>ОЗУ:</b> {avg_ram:>5.1f}%"
-        )
-        
-        bot = get_bot()
-        for admin in admin_ids:
-            if not is_admin_notification_enabled(admin):
+    while True:
+        try:
+            await asyncio.sleep(LOAD_CHECK_INTERVAL)
+            admin_ids = get_admin_ids()
+
+            if not admin_ids:
                 continue
-            if not is_admin_load_notification_enabled(admin):
+
+            cpu_threshold, memory_threshold = get_load_thresholds()
+
+            is_sustained, avg_cpu, avg_ram = await asyncio.to_thread(
+                _check_sustained_high_load, cpu_threshold, memory_threshold
+            )
+
+            if not is_sustained:
                 continue
-            last_sent = _last_load_alerts.get(admin, 0)
-            if now_ts - last_sent < LOAD_ALERT_COOLDOWN:
-                continue
-            try:
-                await bot.send_message(admin, alert_text, parse_mode="HTML")
-                _last_load_alerts[admin] = now_ts
-                logger.info(f"✅ Уведомление о нагрузке отправлено админу {admin}")
-            except Exception as e:
-                logger.error(f"Ошибка отправки уведомления о нагрузке: {e}")
+
+            logger.warning(f"⚠️ Высокая нагрузка: CPU={avg_cpu:.1f}%, RAM={avg_ram:.1f}%")
+
+            now_ts = time.time()
+            alert_text = (
+                f"<b>⚠️ Высокая нагрузка на сервер</b>\n"
+                f"<i>(держится более 5 минут)</i>\n\n"
+                f"{get_color_by_percent(avg_cpu)}<b>ЦП:</b> {avg_cpu:>5.1f}%\n"
+                f"{get_color_by_percent(avg_ram)}<b>ОЗУ:</b> {avg_ram:>5.1f}%"
+            )
+
+            bot = get_bot()
+            for admin in admin_ids:
+                if not is_admin_notification_enabled(admin):
+                    continue
+                if not is_admin_load_notification_enabled(admin):
+                    continue
+                last_sent = _last_load_alerts.get(admin, 0)
+                if now_ts - last_sent < LOAD_ALERT_COOLDOWN:
+                    continue
+                try:
+                    await bot.send_message(admin, alert_text, parse_mode="HTML")
+                    _last_load_alerts[admin] = now_ts
+                    logger.info(f"✅ Уведомление о нагрузке отправлено админу {admin}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления о нагрузке: {e}")
+
+            # 🔽 ВСТАВЛЕНО СЮДА: Очистка устаревших записей (старше 2 часов)
+            expired = [aid for aid, ts in _last_load_alerts.items() if now_ts - ts > 7200]
+            for aid in expired:
+                del _last_load_alerts[aid]
+
+        except Exception as e:
+            logger.error(f"Ошибка в цикле мониторинга: {e}", exc_info=True)

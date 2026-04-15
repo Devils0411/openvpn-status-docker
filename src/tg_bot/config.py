@@ -1,80 +1,212 @@
 """Управление конфигурацией Telegram-бота."""
-
 import os
 import json
+import time
 import logging
 from config import Config
+from types import MappingProxyType
 
 logger = logging.getLogger("tg_bot")
-_settings_cache = None
-_settings_mtime = 0
+
+# Кэш конфигураций
+_config_cache = {
+    "allowed_users": set(),
+    "client_map": {},
+    "settings": {},
+    "admin_ids": [],
+    "env_mtime": 0,
+    "settings_mtime": 0,
+    "expires": 0,
+    "TTL": 15  # секунд
+}
 
 SETTINGS_PATH = Config.SETTINGS_PATH
 ENV_PATH = Config.ENV_PATH
 CLIENT_MAPPING_KEY = "CLIENT_MAPPING"
 TG_BOT_PROFILE_SEEDED_KEY = "tg_bot_profile_seeded"
-
 ITEMS_PER_PAGE = 5
 DEFAULT_CPU_ALERT_THRESHOLD = 80
 DEFAULT_MEMORY_ALERT_THRESHOLD = 80
 LOAD_CHECK_INTERVAL = 60
 LOAD_ALERT_COOLDOWN = 30 * 60
 
+def _refresh_cache():
+    """Обновляет кэш только если файлы изменились или истёк TTL."""
+    now = time.time()
+    if now < _config_cache["expires"]:
+        return
 
-def get_bot_token():
-    """Получить токен бота из окружения (ленивая загрузка)."""
-    from dotenv import load_dotenv
-    load_dotenv(ENV_PATH)
-    return os.getenv("BOT_TOKEN")
-
-def get_admin_ids():
-    """Получить ID администраторов из окружения (ленивая загрузка)."""
-    from dotenv import load_dotenv
-    load_dotenv(ENV_PATH)
-    raw = os.getenv("ADMIN_ID", "")
-    return [int(x) for x in raw.split(",") if x.strip().isdigit()]
-
-def load_settings():
-    """Загрузить настройки из JSON-файла (с кэшированием)."""
-    global _settings_cache, _settings_mtime
     try:
-        current_mtime = os.path.getmtime(SETTINGS_PATH)
-        if _settings_cache is not None and current_mtime == _settings_mtime:
-            return _settings_cache.copy()
+        env_mtime = os.path.getmtime(ENV_PATH)
+        settings_mtime = os.path.getmtime(SETTINGS_PATH)
     except OSError:
-        pass
+        env_mtime = settings_mtime = None
 
+    # Если файлы не менялись, просто продлеваем TTL
+    if env_mtime == _config_cache["env_mtime"] and settings_mtime == _config_cache["settings_mtime"]:
+        _config_cache["expires"] = now + _config_cache["TTL"]
+        return
+
+    # 1. Читаем .env
+    env_vals = {}
+    try:
+        with open(ENV_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line: continue
+                k, v = line.split("=", 1)
+                env_vals[k.strip()] = v.strip()
+    except FileNotFoundError: pass
+
+    # 2. Читаем settings.json
+    settings = {}
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.warning("Файл настроек не найден: %s. Создаю новый. Ошибка: %s", SETTINGS_PATH, e)
-        data = {}
+            settings = json.load(f)
+        if not isinstance(settings, dict): settings = {}
+    except (FileNotFoundError, json.JSONDecodeError): pass
 
-    if not isinstance(data, dict):
-        data = {}
+    settings.setdefault("telegram_admins", {})
+    settings.setdefault("telegram_clients", {})
 
-    data.setdefault("telegram_admins", {})
-    data.setdefault("telegram_clients", {})
+    # 3. Парсим админов
+    raw_admins = env_vals.get("ADMIN_ID", "")
+    admin_ids = [int(x) for x in raw_admins.split(",") if x.strip().isdigit()]
 
-    if not isinstance(data.get("telegram_admins"), dict):
-        data["telegram_admins"] = {}
-    if not isinstance(data.get("telegram_clients"), dict):
-        data["telegram_clients"] = {}
+    # 4. Парсим маппинг клиентов
+    raw_mapping = env_vals.get(CLIENT_MAPPING_KEY, "")
+    client_map = {}
+    if raw_mapping:
+        for item in raw_mapping.split(","):
+            if ":" not in item: continue
+            tid, name = item.split(":", 1)
+            tid, name = tid.strip(), name.strip()
+            if tid.isdigit():
+                client_map.setdefault(tid, []).append(name)
 
-    _settings_cache = data
+    # 5. Формируем set разрешённых
+    allowed = set(admin_ids) | {int(k) for k in client_map.keys()}
+
+    # Обновляем кэш
+    _config_cache.update({
+        "settings": settings,
+        "admin_ids": admin_ids,
+        "client_map": client_map,
+        "allowed_users": allowed,
+        "env_mtime": env_mtime,
+        "settings_mtime": settings_mtime,
+        "expires": now + _config_cache["TTL"]
+    })
+
+def get_bot_token():
+    _refresh_cache()
+    from dotenv import load_dotenv
+    load_dotenv(ENV_PATH) # Оставляем для совместимости, но кэш уже загрузил данные
+    return os.getenv("BOT_TOKEN") or _config_cache.get("settings", {}).get("bot_token")
+
+def get_admin_ids():
+    _refresh_cache()
+    return _config_cache["admin_ids"]
+
+def is_user_allowed_for_bot(user_id: int) -> bool:
+    _refresh_cache()
+    if not _config_cache["admin_ids"]: return True
+    return int(user_id) in _config_cache["allowed_users"]
+
+def get_client_mapping():
+    _refresh_cache()
+    return _config_cache["client_map"]
+
+def get_client_name_for_user(user_id: int):
+    profiles = get_client_mapping().get(str(user_id), [])
+    return profiles[0] if isinstance(profiles, list) and profiles else (profiles if profiles else None)
+
+def load_settings():
+    _refresh_cache()
+    return _config_cache["settings"].copy()
+
+def save_settings(data):
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+    _config_cache["settings"] = data.copy()
+    try: _config_cache["settings_mtime"] = os.path.getmtime(SETTINGS_PATH)
+    except OSError: pass
+    _config_cache["expires"] = 0 # Сброс TTL для принудительного обновления
+
+def set_client_mapping(telegram_id: str, client_name: str):
+    client_map = get_client_mapping()
+    tid = str(telegram_id)
+    if tid not in client_map: client_map[tid] = []
+    elif isinstance(client_map[tid], str): client_map[tid] = [client_map[tid]]
+    if client_name not in client_map[tid]: client_map[tid].append(client_name)
+
+    serialized = ",".join(f"{tid}:{p}" for profiles in client_map.values() for p in (profiles if isinstance(profiles, list) else [profiles]))
+    update_env_values({CLIENT_MAPPING_KEY: serialized})
+    _config_cache["client_map"] = client_map
+    _config_cache["expires"] = 0
+
+def remove_client_mapping(telegram_id: str, client_name: str = None):
+    client_map = get_client_mapping()
+    tid = str(telegram_id)
+    if tid not in client_map: return False
+    existing = client_map[tid] if isinstance(client_map[tid], list) else [client_map[tid]]
+    if client_name:
+        if client_name in existing: existing.remove(client_name)
+        else: return False
+    else: existing = []
+
+    if existing: client_map[tid] = existing
+    else: client_map.pop(tid, None)
+
+    serialized = ",".join(f"{t}:{p}" for t, profiles in client_map.items() for p in (profiles if isinstance(profiles, list) else [profiles]))
+    update_env_values({CLIENT_MAPPING_KEY: serialized or ""})
+    _config_cache["client_map"] = client_map
+    _config_cache["expires"] = 0
+    return True
+
+def update_env_values(updates):
+    updates = {k: v for k, v in updates.items() if k}
+    if not updates: return
+    updated_keys = set()
     try:
-        _settings_mtime = os.path.getmtime(SETTINGS_PATH)
-    except OSError:
-        _settings_mtime = 0
+        with open(ENV_PATH, "r", encoding="utf-8") as f: lines = f.readlines()
+    except FileNotFoundError: lines = []
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line); continue
+        key, _ = line.split("=", 1)
+        if key.strip() in updates:
+            new_lines.append(f"{key.strip()}={updates[key.strip()]}\n")
+            updated_keys.add(key.strip())
+        else: new_lines.append(line)
+    for k, v in updates.items():
+        if k not in updated_keys: new_lines.append(f"{k}={v}\n")
+    with open(ENV_PATH, "w", encoding="utf-8") as f: f.writelines(new_lines)
+    _config_cache["env_mtime"] = 0 # Сброс для принудительного перечитывания
 
-    return data.copy()
+# Остальные функции оставляем без изменений, они автоматически подхватят кэш
+def get_load_thresholds():
+    data = load_settings()
+    thresholds = data.get("load_thresholds") or {}
+    if not isinstance(thresholds, dict): thresholds = {}
+    return thresholds.get("cpu", DEFAULT_CPU_ALERT_THRESHOLD), thresholds.get("memory", DEFAULT_MEMORY_ALERT_THRESHOLD)
 
+def set_load_thresholds(cpu_threshold: int = None, memory_threshold: int = None):
+    data = load_settings()
+    thresholds = data.get("load_thresholds") or {}
+    if not isinstance(thresholds, dict): thresholds = {}
+    if cpu_threshold is not None: thresholds["cpu"] = int(cpu_threshold)
+    if memory_threshold is not None: thresholds["memory"] = int(memory_threshold)
+    data["load_thresholds"] = thresholds
+    save_settings(data)
 
 def is_tg_bot_profile_seeded() -> bool:
     """Уже выполнялась однократная установка описания и «о боте» через API."""
+    # load_settings() теперь автоматически использует кэш
     return bool(load_settings().get(TG_BOT_PROFILE_SEEDED_KEY))
-
 
 def mark_tg_bot_profile_seeded() -> None:
     """Пометить, что описание и «о боте» заданы (чтобы не перезаписывать при каждом запуске)."""
@@ -82,251 +214,18 @@ def mark_tg_bot_profile_seeded() -> None:
     data[TG_BOT_PROFILE_SEEDED_KEY] = True
     save_settings(data)
 
-
-def save_settings(data):
-    """Сохранить настройки в JSON-файл."""
-    global _settings_cache, _settings_mtime
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-        f.write("\n")
-
-    _settings_cache = data.copy()
-    try:
-        _settings_mtime = os.path.getmtime(SETTINGS_PATH)
-    except OSError:
-        _settings_mtime = 0
-
-def read_env_values():
-    """Прочитать все значения из файла .env."""
-    values = {}
-    try:
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
-    except FileNotFoundError:
-        pass
-    return values
-
-def update_env_values(updates):
-    """Обновить значения в файле .env."""
-    updates = {k: v for k, v in updates.items() if k}
-    if not updates:
-        return
-    updated_keys = set()
-    try:
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        lines = []
-
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in line:
-            new_lines.append(line)
-            continue
-        key, _ = line.split("=", 1)
-        key = key.strip()
-        if key in updates:
-            new_lines.append(f"{key}={updates[key]}\n")
-            updated_keys.add(key)
-        else:
-            new_lines.append(line)
-
-    for key, value in updates.items():
-        if key not in updated_keys:
-            new_lines.append(f"{key}={value}\n")
-
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-
-def get_client_mapping():
-    """Получить привязку клиентов к ID Telegram (поддержка нескольких профилей)."""
-    env_values = read_env_values()
-    raw_value = env_values.get(CLIENT_MAPPING_KEY, "")
-    mapping = {}
-    if not raw_value:
-        return mapping
-    try:
-        for item in raw_value.split(","):
-            item = item.strip()
-            if not item or ":" not in item:
-                continue
-            telegram_id, client_name = item.split(":", 1)
-            telegram_id = telegram_id.strip()
-            client_name = client_name.strip()
-            if not telegram_id or not client_name:
-                continue
-            
-            # Если такой ID уже есть, добавляем профиль в список, иначе создаем новый
-            if telegram_id in mapping:
-                if isinstance(mapping[telegram_id], list):
-                    mapping[telegram_id].append(client_name)
-                else:
-                    mapping[telegram_id] = [mapping[telegram_id], client_name]
-            else:
-                mapping[telegram_id] = [client_name]
-    except Exception as e:
-        logger.error(f"Ошибка парсинга CLIENT_MAPPING: {e}")
-
-    return mapping
-
-def get_client_name_for_user(user_id: int):
-    """Получить имя клиента по ID пользователя Telegram (первый профиль)."""
-    profiles = get_client_mapping().get(str(user_id), [])
-    if isinstance(profiles, list):
-        return profiles[0] if profiles else None
-    return profiles
-
-
-async def get_client_info_for_user(user_id: int):
-    """Получает полную информацию о профилях пользователя с датами истечения."""
-    profiles = get_client_mapping().get(str(user_id), [])
-    if not profiles:
-        return []
-    
-    if not isinstance(profiles, list):
-        profiles = [profiles]
-    
-    # Получаем список всех клиентов OpenVPN с датами
-    try:
-        clients = await get_clients("openvpn")
-    except:
-        logger.error(f"Ошибка получения клиентов: {e}")
-        clients = []
-    
-    result = []
-    for profile in profiles:
-        client_info = {
-            "name": profile,
-            "expire": None
-        }
-        # Ищем совпадение в списке клиентов
-        for client in clients:
-            if isinstance(client, dict) and client.get("name") == profile:
-                client_info["expire"] = client.get("expire")
-                break
-        result.append(client_info)
-    
-    return result
-
-
-def get_all_profiles_for_user(user_id: int):
-    """Получить все профили пользователя (список)."""
-    profiles = get_client_mapping().get(str(user_id), [])
-    if isinstance(profiles, list):
-        return profiles
-    return [profiles] if profiles else []
-
-def set_client_mapping(telegram_id: str, client_name: str):
-    """Установить привязку клиента для пользователя Telegram (добавляет к существующим)."""
-    client_map = get_client_mapping()
-    tid = str(telegram_id)
-    if tid not in client_map:
-        client_map[tid] = []
-    elif isinstance(client_map[tid], str):
-        client_map[tid] = [client_map[tid]]
-    
-    if client_name not in client_map[tid]:
-        client_map[tid].append(client_name)
-    
-    serialized_items = []
-    for tid, profiles in client_map.items():
-        if isinstance(profiles, list):
-            for prof in profiles:
-                serialized_items.append(f"{tid}:{prof}")
-        else:
-            serialized_items.append(f"{tid}:{profiles}")
-    
-    serialized = ",".join(serialized_items)
-    update_env_values({CLIENT_MAPPING_KEY: serialized})
-    logger.info(f"Добавлена привязка клиента: {telegram_id} → {client_name}")
-
-
-def is_user_allowed_for_bot(user_id: int) -> bool:
-    """Можно обрабатывать обновления: админ, привязанный клиент, либо админы ещё не заданы (первичная настройка)."""
-    admin_ids = get_admin_ids()
-    if not admin_ids:
-        return True
-    uid = int(user_id)
-    if uid in admin_ids:
-        return True
-    if get_client_name_for_user(uid):
-        return True
-    return False
-
-
-def remove_client_mapping(telegram_id: str, client_name: str = None):
-    """Удаляет привязку клиента."""
-    try:
-        client_map = get_client_mapping()
-        telegram_id = str(telegram_id)
-        
-        if telegram_id not in client_map:
-            logger.warning(f"⚠️ Привязка не найдена для удаления: {telegram_id}")
-            return False
-            
-        existing_profiles = client_map[telegram_id]
-        if not isinstance(existing_profiles, list):
-            existing_profiles = [existing_profiles]
-        
-        if client_name:
-            # Удаляем конкретный профиль
-            if client_name in existing_profiles:
-                existing_profiles.remove(client_name)
-                logger.info(f"✅ Удалена привязка: {telegram_id} → {client_name}")
-            else:
-                logger.warning(f"⚠️ Профиль не найден: {client_name}")
-                return False
-        else:
-            # Если профиль не указан, удаляем все привязки пользователя
-            logger.info(f"✅ Удалены все привязки пользователя: {telegram_id}")
-            existing_profiles = []
-        
-        if existing_profiles:
-            client_map[telegram_id] = existing_profiles
-        else:
-            client_map.pop(telegram_id, None)
-        
-        # Сериализуем обратно
-        serialized_items = []
-        for tid, profiles in client_map.items():
-            if isinstance(profiles, list):
-                for prof in profiles:
-                    serialized_items.append(f"{tid}:{prof}")
-            else:
-                serialized_items.append(f"{tid}:{profiles}")
-        
-        serialized = ",".join(serialized_items) if serialized_items else ""
-        update_env_values({CLIENT_MAPPING_KEY: serialized})
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка удаления привязки клиента: {e}")
-        return False
-
-def get_load_thresholds():
-    """Получить пороги оповещения по CPU и памяти."""
+def get_user_timezone(user_id: int) -> str:
+    """Получить временную зону пользователя (по умолчанию Europe/Moscow)."""
     data = load_settings()
-    thresholds = data.get("load_thresholds") or {}
-    if not isinstance(thresholds, dict):
-        thresholds = {}
-    cpu = thresholds.get("cpu", DEFAULT_CPU_ALERT_THRESHOLD)
-    memory = thresholds.get("memory", DEFAULT_MEMORY_ALERT_THRESHOLD)
-    return cpu, memory
+    user_settings = data.get("user_settings", {})
+    return user_settings.get(str(user_id), {}).get("timezone", "Europe/Moscow")
 
-def set_load_thresholds(cpu_threshold: int = None, memory_threshold: int = None):
-    """Установить пороги оповещения по CPU и/или памяти."""
+def set_user_timezone(user_id: int, timezone: str):
+    """Установить временную зону пользователя."""
     data = load_settings()
-    thresholds = data.get("load_thresholds") or {}
-    if not isinstance(thresholds, dict):
-        thresholds = {}
-    if cpu_threshold is not None:
-        thresholds["cpu"] = int(cpu_threshold)
-    if memory_threshold is not None:
-        thresholds["memory"] = int(memory_threshold)
-    data["load_thresholds"] = thresholds
+    user_settings = data.get("user_settings", {})
+    if str(user_id) not in user_settings:
+        user_settings[str(user_id)] = {}
+    user_settings[str(user_id)]["timezone"] = timezone
+    data["user_settings"] = user_settings
     save_settings(data)

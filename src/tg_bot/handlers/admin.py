@@ -36,8 +36,25 @@ def _get_server_ip():
 
 async def _get_bot():
     """Получить экземпляр бота (ленивая инициализация)."""
-    from ..bot import get_bot
+    from src.tg_bot.bot import get_bot
     return get_bot()
+
+
+async def _get_vpn_clients(vpn_type: str):
+    """Получить список клиентов. Для WireGuard используется Amnezia API, для OpenVPN - shell."""
+    if vpn_type == "wireguard":
+        from ..bot import get_amnezia_client
+        amnezia = await get_amnezia_client()
+        if amnezia:
+            try:
+                api_clients = await amnezia.get_clients()
+                # Приводим к формату, ожидаемому клавиатурой: [{"name": "...", "expire": "..."}, ...]
+                return [{"name": c.get("name", c.get("id")), "expire": c.get("expire", "unknown")} for c in api_clients]
+            except Exception as e:
+                logger.error("❌ Ошибка получения списка из Amnezia API: %s", e)
+                raise RuntimeError("Не удалось получить список клиентов через API")
+    # OpenVPN или fallback (если API недоступен)
+    return await get_clients(vpn_type)
 
 
 @router.callback_query(lambda c: c.from_user.id in get_admin_ids())
@@ -185,7 +202,7 @@ async def handle_callback_query(callback: types.CallbackQuery, state: FSMContext
         # Initialize deletion list
         if data in ["2", "5"]:
             vpn_type = "openvpn" if data == "2" else "wireguard"
-            clients = await get_clients(vpn_type)
+            clients = await _get_vpn_clients(vpn_type)
             
             if not clients:
                 await callback.message.edit_text("❌ Нет клиентов для удаления")
@@ -203,37 +220,63 @@ async def handle_callback_query(callback: types.CallbackQuery, state: FSMContext
         # Confirm deletion
         if data.startswith("confirm_"):
             _, vpn_type, client_name = data.split("_", 2)
-            option = "2" if vpn_type == "openvpn" else "5"
             
-            try:
-                result = await execute_script(option, client_name)
+            if vpn_type == "wireguard":
+                from ..bot import get_amnezia_client
+                amnezia = await get_amnezia_client()
+                if not amnezia:
+                    await callback.message.edit_text("❌ Ошибка: подключение к AmneziaWG недоступно")
+                    await callback.answer()
+                    await state.clear()
+                    return
                 
-                if vpn_type == "openvpn" and result["returncode"] == 0:
-                    deleted_files = await cleanup_openvpn_files(client_name)
-                    if deleted_files:
-                        result["additional_deleted"] = deleted_files
-                
-                if result["returncode"] == 0:
-                    msg = f"✅ Клиент {client_name} удален!"
-                    if vpn_type == "openvpn" and result.get("additional_deleted"):
-                        msg += f"\nДополнительно удалено файлов: {len(result['additional_deleted'])}"
+                try:
+                    # 1. Находим клиента по имени, чтобы получить его ID
+                    clients = await amnezia.get_clients()
+                    client = next((c for c in clients if c.get("name") == client_name), None)
+                    if not client or not client.get("id"):
+                        raise RuntimeError(f"Клиент {client_name} не найден в списке AmneziaWG")
                     
-                    logger.info("🗑️ Клиент удалён: %s (%s)", client_name, vpn_type)
+                    # 2. Удаляем по ID
+                    success = await amnezia.delete_client(str(client["id"]))
+                    if not success:
+                        raise RuntimeError("API вернул ошибку при удалении")
+                    
+                    msg = f"✅ Клиент {client_name} удалён AmneziaWG!"
+                    logger.info("🗑️ Клиент удалён через API: %s", client_name)
                     await callback.message.edit_text(msg)
                     server_ip = _get_server_ip()
-                    await callback.message.answer("Главное меню:", reply_markup=create_main_menu(server_ip))
-                    log_action("bot", callback.from_user.id, callback.from_user.full_name, "client_delete", f"{client_name} ({vpn_type})")
-                    await notify_admins(callback.from_user.id, callback.from_user.full_name, f"удалил клиента <b>{client_name}</b> ({vpn_type})")
-                else:
-                    logger.error("❌ Ошибка удаления клиента %s: %s", client_name, result['stderr'])
-                    await callback.message.edit_text(f"❌ Ошибка: {result['stderr']}")
+                    await callback.message.answer("Главное меню: ", reply_markup=create_main_menu(server_ip))
+                    log_action("bot", callback.from_user.id, callback.from_user.full_name, "client_delete", f"{client_name} (amnezia-wg)")
+                    await notify_admins(callback.from_user.id, callback.from_user.full_name, f"удалил клиента <b>{client_name}</b> (AmneziaWG)")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка удаления через Amnezia API: {e}", exc_info=True)
+                    await callback.message.edit_text(f"❌ Ошибка: {str(e)}")
+                finally:
+                    await callback.answer()
+                    await state.clear()
+                return
+
+            # OpenVPN: старый метод через shell-скрипт
+            option = "2"
+            result = await execute_script(option, client_name)
+            if result["returncode"] == 0:
+                deleted_files = await cleanup_openvpn_files(client_name)
+                msg = f"✅ Клиент {client_name} удален! "
+                if deleted_files:
+                    msg += f"\nДополнительно удалено файлов: {len(deleted_files)} "
+                logger.info("🗑️ Клиент удалён: %s (openvpn)", client_name)
+                await callback.message.edit_text(msg)
+                server_ip = _get_server_ip()
+                await callback.message.answer("Главное меню: ", reply_markup=create_main_menu(server_ip))
+                log_action("bot", callback.from_user.id, callback.from_user.full_name, "client_delete", f"{client_name} (openvpn)")
+                await notify_admins(callback.from_user.id, callback.from_user.full_name, f"удалил клиента <b>{client_name}</b> (openvpn)")
+            else:
+                logger.error("❌ Ошибка удаления клиента %s: %s", client_name, result['stderr'])
+                await callback.message.edit_text(f"❌ Ошибка: {result['stderr']}")
             
-            except Exception as e:
-                logger.error("❌ Ошибка при удалении клиента: %s", e, exc_info=True)
-            
-            finally:
-                await callback.answer()
-                await state.clear()
+            await callback.answer()
+            await state.clear()
             return
         
         if data == "cancel_delete":
@@ -245,7 +288,7 @@ async def handle_callback_query(callback: types.CallbackQuery, state: FSMContext
         # Client list
         if data in ["3", "6"]:
             vpn_type = "openvpn" if data == "3" else "wireguard"
-            clients = await get_clients(vpn_type)
+            clients = await _get_vpn_clients(vpn_type)
             total_pages = (len(clients) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
             await callback.message.edit_text(
                 "Список клиентов:",

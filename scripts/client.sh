@@ -259,38 +259,15 @@ listOpenVPN(){
     done | sort
 }
 
-listWireGuard(){
-    [[ -n "$CLIENT_NAME" ]] && return
-    echo
-    echo 'WireGuard/AmneziaWG client names:'
-    
-    # Путь к конфигам WireGuard (проверьте актуальность пути на вашем сервере)
-    WG_DIR="/etc/wireguard"
-    
-    # Ищем файлы конфига клиентов (обычно wg0.conf или в подпапках)
-    # В данном примере ищем файлы .conf, исключая основной серверный конфиг
-    find "$WG_DIR" -name "*.conf" -type f 2>/dev/null | while read -r conf_file; do
-        filename=$(basename "$conf_file")
-        # Исключаем основные конфиги сервера
-        [[ "$filename" == "wg0.conf" ]] && continue
-        [[ "$filename" == "server.conf" ]] && continue
-        
-        # Извлекаем имя клиента из имени файла (например, client-name.conf -> client-name)
-        client_name="${filename%.conf}"
-        echo "$client_name"
-    done | sort
-}
 
-
-if ! [[ "$OPTION" =~ ^[1-6]$ ]]; then
+if ! [[ "$OPTION" =~ ^[1-3]$ ]]; then
 	echo
 	echo 'Please choose option:'
 	echo '    1) OpenVPN - Добавление/Обновление сертификата клиента'
 	echo '    2) OpenVPN - Удаление клиента'
 	echo '    3) OpenVPN - список клиентов'
-	echo '    6) WireGuard - список клиентов'
-	until [[ "$OPTION" =~ ^[1-6]$ ]]; do
-		read -rp 'Option choice [1-6]: ' -e OPTION
+	until [[ "$OPTION" =~ ^[1-3]$ ]]; do
+		read -rp 'Option choice [1-3]: ' -e OPTION
 	done
 fi
 
@@ -309,10 +286,6 @@ case "$OPTION" in
 	3)
 		echo 'OpenVPN - List clients'
 		listOpenVPN
-		;;
-	6)
-		echo 'WireGuard - List clients'
-		listWireGuard
 		;;
 esac
 exit 0

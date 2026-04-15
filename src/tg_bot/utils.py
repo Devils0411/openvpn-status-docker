@@ -2,36 +2,36 @@
 import os
 import asyncio
 import datetime
+import urllib.request
+import urllib.error
+import socket
 import logging
 logger = logging.getLogger("tg_bot")
 _server_ip_cache = None
 
 def get_external_ip():
-    """Получить внешний IP-адрес (с кэшированием)."""
+    """Получить внешний IP-адрес (stdlib, без requests)."""
     global _server_ip_cache
-    logger.debug("🔍 Запрос внешнего IP-адреса")
     if _server_ip_cache is not None:
-        logger.debug("✅ IP возвращён из кэша: %s", _server_ip_cache)
         return _server_ip_cache
-    
-    import requests
+
     try:
-        response = requests.get("https://api.ipify.org", timeout=10)
-        if response.status_code == 200:
-            _server_ip_cache = response.text
-            logger.debug("✅ Внешний IP получен: %s", _server_ip_cache)
-            return _server_ip_cache
-        logger.warning("⚠️ Не удалось получить внешний IP. Статус: %s", response.status_code)
+        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as response:
+            _server_ip_cache = response.read().decode("utf-8").strip()
+        logger.debug("✅ Внешний IP получен: %s", _server_ip_cache)
+        return _server_ip_cache
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, socket.timeout):
+            logger.error("❌ Превышено время ожидания при получении IP.")
+        elif isinstance(e.reason, socket.gaierror):
+            logger.error("❌ Ошибка DNS: нет подключения к интернету.")
+        else:
+            logger.error(f"❌ Ошибка сети при получении IP: {e.reason}")
         return "IP не найден"
-    except requests.Timeout:
-        logger.error("❌ Ошибка: запрос превысил время ожидания при получении IP.")
-        return "Ошибка: запрос превысил время ожидания."
-    except requests.ConnectionError:
-        logger.error("❌ Ошибка: нет подключения к интернету при получении IP.")
-        return "Ошибка: нет подключения к интернету."
-    except requests.RequestException as e:
-        logger.error("❌ Ошибка при запросе внешнего IP: %s", e)
-        return f"Ошибка при запросе: {e}"
+    except Exception as e:
+        logger.error(f"❌ Ошибка при запросе внешнего IP: {e}")
+        return "IP не найден"
+
 
 async def execute_script(option: str, client_name: str = None, days: str = None):
     """Выполнить shell-скрипт управления VPN."""
@@ -142,15 +142,15 @@ def get_color_by_percent(percent):
 
 def format_vpn_clients(clients_dict):
     """Форматировать словарь клиентов VPN в строку."""
-    total = clients_dict['WireGuard'] + clients_dict['OpenVPN']
+    total = clients_dict.get('AmneziaWG', 0) + clients_dict.get('OpenVPN', 0)
     if total == 0:
         return "0 шт."
     return f"""
-├ WireGuard: {clients_dict['WireGuard']} шт.
-└ OpenVPN: {clients_dict['OpenVPN']} шт."""
+├ AmneziaWG: {clients_dict.get('AmneziaWG', 0)} шт.
+└ OpenVPN: {clients_dict.get('OpenVPN', 0)} шт."""
 
 def parse_handshake_time(raw_value: str):
-    """Разобрать строку времени handshake WireGuard."""
+    """Разобрать строку времени handshake AmeziaWG."""
     value = (raw_value or "").strip()
     if not value:
         return None
@@ -228,7 +228,7 @@ def read_wg_config(file_path):
                     peers_count += 1
                 elif line.startswith("PublicKey =") and current_client_name:
                     public_key = line.split("=", 1)[1].strip()
-                    client_mapping[public_key] = current_name
+                    client_mapping[public_key] = current_client_name
             
             logger.debug("✅ Прочитано %d пиров из %s, маппингов: %d", peers_count, file_path, len(client_mapping))
     except FileNotFoundError:

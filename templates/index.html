@@ -179,30 +179,78 @@
       </div>
     </div>
 
-    <section class="dash-panel">
-      <div class="dash-panel__hd">
-        <i class="bi bi-ethernet dash-panel__hd-ic text-primary" aria-hidden="true"></i>
-        <span class="dash-panel__hd-t">Накопленный трафик</span>
-        <code id="network_interface" class="dash-mon__iface small ms-auto text-truncate" style="max-width: 12rem;">Загрузка…</code>
-      </div>
-      <div class="row g-2 g-md-3">
-        <div class="col-12 col-sm-6">
-          <div class="dash-mini">
-            <span class="dash-mini__lbl text-success"><i class="bi bi-arrow-down-circle me-1" aria-hidden="true"></i>RX</span>
-            <div id="rx_bytes" class="dash-mini__val font-monospace">Загрузка…</div>
+<!-- НАКОПЛЕННЫЙ ТРАФИК -->
+<section class="dash-panel mb-4">
+  <div class="dash-panel__hd d-flex align-items-center justify-content-between">
+    <div>
+      <i class="bi bi-hdd-network dash-panel__hd-ic text-primary me-2" aria-hidden="true"></i>
+      <span class="dash-panel__hd-t">НАКОПЛЕННЫЙ ТРАФИК</span>
+    </div>
+  </div>
+
+  {% if system_info and system_info.network_interfaces %}
+    {% for iface_name, iface_data in system_info.network_interfaces.items() %}
+    
+    <!-- Блок для интерфейса: {{ iface_name }} -->
+    <div class="interface-traffic-block mb-3 {% if not loop.last %}pb-3 border-bottom{% endif %}">
+      
+      <!-- Заголовок интерфейса -->
+      <h6 class="text-muted mb-2 small text-uppercase fw-bold">
+        <i class="bi bi-ethernet me-1"></i>{{ iface_data.alias }} <span class="fw-normal text-lowercase">({{ iface_name }})</span>
+      </h6>
+
+      <div class="row g-3">
+        <!-- RX -->
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="dash-mini bg-light rounded p-3 h-100">
+            <span class="dash-mini__lbl text-success fw-bold small">
+              <i class="bi bi-arrow-down-circle me-1"></i>RX
+            </span>
+            <div class="dash-mini__val font-monospace fs-6 fw-bold">{{ iface_data.rx }}</div>
+            <div class="text-muted small">с uptime</div>
           </div>
         </div>
-        <div class="col-12 col-sm-6">
-          <div class="dash-mini">
-            <span class="dash-mini__lbl text-primary"><i class="bi bi-arrow-up-circle me-1" aria-hidden="true"></i>TX</span>
-            <div id="tx_bytes" class="dash-mini__val font-monospace">Загрузка…</div>
+
+        <!-- TX -->
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="dash-mini bg-light rounded p-3 h-100">
+            <span class="dash-mini__lbl text-primary fw-bold small">
+              <i class="bi bi-arrow-up-circle me-1"></i>TX
+            </span>
+            <div class="dash-mini__val font-monospace fs-6 fw-bold">{{ iface_data.tx }}</div>
+            <div class="text-muted small">с uptime</div>
+          </div>
+        </div>
+
+        <!-- RX (мес) -->
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="dash-mini bg-light rounded p-3 h-100">
+            <span class="dash-mini__lbl text-success small">
+              <i class="bi bi-arrow-down-circle me-1"></i>RX <span class="text-muted">(мес)</span>
+            </span>
+            <div class="monthly-rx dash-mini__val font-monospace small fw-bold" data-iface="{{ iface_name }}">Загрузка…</div>
+          </div>
+        </div>
+
+        <!-- TX (мес) -->
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="dash-mini bg-light rounded p-3 h-100">
+            <span class="dash-mini__lbl text-primary small">
+              <i class="bi bi-arrow-up-circle me-1"></i>TX <span class="text-muted">(мес)</span>
+            </span>
+            <div class="monthly-tx dash-mini__val font-monospace small fw-bold" data-iface="{{ iface_name }}">Загрузка…</div>
           </div>
         </div>
       </div>
-    </section>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="text-center p-4 text-muted">Нет данных о сетевых интерфейсах</div>
+  {% endif %}
+</section>
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="{{ url_for('static', filename='vendor/chart.js/chart.umd.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/main_page.js') }}"></script>
 {% endblock %}

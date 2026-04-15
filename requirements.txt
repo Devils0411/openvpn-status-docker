@@ -55,3 +55,4 @@ WTForms==3.1.2
 yarl==1.18.3
 zipp==3.20.2
 zope.interface==7.1.0
+docker>=7.0.0
