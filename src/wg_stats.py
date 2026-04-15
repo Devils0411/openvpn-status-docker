@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Оптимизированный скрипт сбора и сохранения статистики WireGuard (через синхронное Amnezia API)"""
 import os
+import sys
 import time
 import json
 import sqlite3
@@ -19,7 +20,7 @@ from config import Config
 LOG_DIR = Config.LOGS_PATH
 os.makedirs(LOG_DIR, exist_ok=True)
 INFO_LOG = os.path.join(LOG_DIR, 'wg_stats.info.log')
-ERROR_LOG = os.path.join(LOG_DIR, 'wg_stats.error.log')
+ERROR_LOG = os.path.join(LOG_DIR, 'wg_stats.stderr.log')
 MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
 BACKUP_COUNT = 5
 LOG_LEVEL = getattr(Config, 'LOG_LEVEL', logging.INFO)
@@ -154,7 +155,7 @@ def get_wireguard_stats() -> Optional[List[Dict]]:
     """Получение статистики через синхронное API Amnezia WG Easy."""
     conn_info = AmneziaDiscoverer.get_connection_info()
     if not conn_info:
-        logger.warning("⚠️ Контейнер Amnezia не найден через Docker")
+        logger.debug("⚠️ Контейнер Amnezia не найден через Docker")
         return None
 
     ip, password, port = conn_info
@@ -435,6 +436,10 @@ def main():
     logger.info(f"📍 Python: {__import__('sys').version.split()[0]}")
     logger.info(f"📁 БД: {DB_PATH} | Логи: {LOG_DIR}")
     logger.info(f"📅 Хранение: {get_stats_retention_days()} дней")
+
+    if not AmneziaDiscoverer.get_connection_info():
+        logger.info("❌ КОНТЕЙНЕР AMNEZIA НЕ НАЙДЕН. Скрипт завершает работу.")
+        sys.exit(1)
     try:
         init_db()
         inter_date = datetime.now().strftime("%Y-%m-%d")

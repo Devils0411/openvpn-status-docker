@@ -1,12 +1,18 @@
 """Клиент для взаимодействия с контейнером AmneziaWG Easy."""
 import logging
 import re
-from typing import Optional, Dict, Any, Tuple
+import time
 import aiohttp
 from aiohttp import CookieJar
+from typing import Optional, Dict, Any, Tuple
 import docker
 
 logger = logging.getLogger("tg_bot")
+
+# Простой кэш статуса контейнера
+_amnezia_cache = {"is_running": None, "ts": 0.0, "ttl": 15}
+
+
 
 class AmneziaClient:
     """Клиент для управления AmneziaWG Easy через API."""
@@ -150,7 +156,7 @@ class AmneziaContainerFinder:
     def discover(cls) -> Optional[Tuple[str, str]]:
         container = cls.find_amnezia_container()
         if not container:
-            logger.warning("⚠️ Контейнер Amnezia не найден")
+            logger.debug("⚠️ Контейнер Amnezia не найден")
             return None
             
         ip = cls.get_container_ip(container)
@@ -160,3 +166,25 @@ class AmneziaContainerFinder:
             return ip, password
         logger.warning(f"⚠️ Не удалось получить данные: IP={ip}, PASS={'***' if password else None}")
         return None
+
+def is_amnezia_running() -> bool:
+    """Проверяет наличие запущенного контейнера Amnezia. Кэширует результат на 15 сек."""
+    now = time.time()
+    if _amnezia_cache["is_running"] is not None and (now - _amnezia_cache["ts"]) < _amnezia_cache["ttl"]:
+        return _amnezia_cache["is_running"]
+
+    try:
+        client = docker.from_env()
+        for c in client.containers.list():
+            if "amnezia" in c.name.lower():
+                _amnezia_cache["is_running"] = True
+                _amnezia_cache["ts"] = now
+                return True
+        _amnezia_cache["is_running"] = False
+        _amnezia_cache["ts"] = now
+        return False
+    except Exception as e:
+        logger.debug(f"⚠️ Проверка контейнера Amnezia: {e}")
+        _amnezia_cache["is_running"] = False
+        _amnezia_cache["ts"] = now
+        return False

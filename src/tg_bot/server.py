@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 from src.config import Config
 from .config import get_user_timezone
 from .utils import get_color_by_percent, format_vpn_clients, parse_handshake_time, is_peer_online, read_wg_config
+from .amnezia_client import is_amnezia_running
 
 logger = logging.getLogger("tg_bot")
 
@@ -30,6 +31,21 @@ def format_speed(bits_per_second):
         return f"{bits_per_second / 1000**2:.1f} Мбит/с"
     else:
         return f"{bits_per_second / 1000**3:.2f} Гбит/с"
+
+#Считаем OpenVPN синхронно в отдельном потоке (не блокирует event loop)
+def _count_ovpn_sync():
+    """Синхронная функция подсчета клиентов OpenVPN (выносится на верхний уровень)."""
+    total = 0
+    # Используем Config.LOG_FILES, который импортирован в начале файла
+    for path, _ in Config.LOG_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("CLIENT_LIST"):
+                        total += 1
+        except Exception:
+            continue
+    return total
 
 
 async def get_network_speed(interface: str = None, interval: float = 1.0):
@@ -64,8 +80,7 @@ async def get_network_speed(interface: str = None, interval: float = 1.0):
 async def get_server_stats():
     """Получить статистику сервера."""
     try:
-        psutil = _lazy_psutil()
-        
+        psutil = _lazy_psutil()        
         cpu_percent = psutil.cpu_percent(interval=1)
         memory = psutil.virtual_memory()
         memory_percent = memory.percent
@@ -87,7 +102,14 @@ async def get_server_stats():
 
         download_speed, upload_speed = await get_network_speed(main_interface, interval=1.0)
         
-        vpn_clients = await _count_online_clients()
+        # ✅ Безопасный подсчёт клиентов
+        vpn_clients = {"OpenVPN": 0, "AmneziaWG": 0}
+        if is_amnezia_running():
+            vpn_clients = await _count_online_clients()
+        else:
+            # Если Amnezia нет, считаем только OpenVPN
+            vpn_clients["OpenVPN"] = await asyncio.to_thread(_count_ovpn_sync)
+            
         clients_section = format_vpn_clients(vpn_clients)
         
         stats_text = f"""
@@ -342,7 +364,30 @@ def _format_online_line(entry: dict) -> str:
 async def get_online_clients_text(user_id: int = None):
     """Получить отформатированный текст онлайн-клиентов."""
     openvpn_entries = get_openvpn_online_entries(user_id=user_id)
-    amnezia_entries = await get_amnezia_online_entries(user_id=user_id)
+    amnezia_entries = []
+    if is_amnezia_running():
+        try:
+            amnezia_entries = await get_amnezia_online_entries(user_id=user_id)
+        except Exception as e:
+            logger.debug(f"⚠️ Ошибка получения клиентов Amnezia: {e}")
+
+    lines = ["<b>👥 Кто онлайн: </b>", " "]
+    if openvpn_entries:
+        lines.append("<b>OpenVPN: </b>")
+        lines.extend(_format_online_line(e) for e in openvpn_entries)
+    else:
+        lines.append("<b>OpenVPN: </b> нет активных клиентов")
+    lines.append(" ")
+    
+    if amnezia_entries:
+        lines.append("<b>AmneziaWG: </b>")
+        lines.extend(_format_online_line(e) for e in amnezia_entries)
+    elif is_amnezia_running():
+        lines.append("<b>AmneziaWG: </b> нет активных клиентов")
+    else:
+        logger.debug(f"⚠️ AmneziaWG контейнер не запущен")
+
+    return "\n".join(lines)
     
     lines = ["<b>👥 Кто онлайн:</b>", ""]
     
@@ -405,19 +450,6 @@ def _format_uptime(uptime_string):
 
 async def _count_online_clients():
     """Асинхронный подсчёт онлайн-клиентов."""
-    # 1. Считаем OpenVPN синхронно в отдельном потоке (не блокирует event loop)
-    def _count_ovpn_sync():
-        total = 0
-        for path, _ in Config.LOG_FILES:
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("CLIENT_LIST"):
-                            total += 1
-            except Exception:
-                continue
-        return total
-
     try:
         total_openvpn = await asyncio.to_thread(_count_ovpn_sync)
     except Exception as e:
@@ -426,22 +458,23 @@ async def _count_online_clients():
 
     # 2. Считаем AmneziaWG асинхронно в основном цикле (без to_thread!)
     online_amnezia = 0
-    try:
-        from src.tg_bot.bot import get_amnezia_client
-        amnezia = await get_amnezia_client()
-        if amnezia:
-            clients = await amnezia.get_clients()
-            for client in clients:
-                if client.get("latestHandshakeAt"):
-                    try:
-                        handshake_time = datetime.fromisoformat(
-                            client["latestHandshakeAt"].replace("Z", "+00:00")
-                        )
-                        if datetime.now(handshake_time.tzinfo) - handshake_time < timedelta(minutes=3):
-                            online_amnezia += 1
-                    except Exception:
-                        continue
-    except Exception as e:
-        logger.debug(f"⚠️ Не удалось получить клиентов Amnezia: {e}")
+    if is_amnezia_running():
+        try:
+            from src.tg_bot.bot import get_amnezia_client
+            amnezia = await get_amnezia_client()
+            if amnezia:
+                clients = await amnezia.get_clients()
+                for client in clients:
+                    if client.get("latestHandshakeAt"):
+                        try:
+                            handshake_time = datetime.fromisoformat(
+                                client["latestHandshakeAt"].replace("Z", "+00:00")
+                            )
+                            if datetime.now(handshake_time.tzinfo) - handshake_time < timedelta(minutes=3):
+                                online_amnezia += 1
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.debug(f"⚠️ Не удалось получить клиентов Amnezia: {e}")
 
     return {"OpenVPN": total_openvpn, "AmneziaWG": online_amnezia}

@@ -1696,8 +1696,8 @@ def count_online_clients(file_paths):
         )
         container_id = id_result.stdout.strip().splitlines()[0] if id_result.stdout.strip() else None
         
-        if not container_id:
-            return "Ошибка: Контейнер amnezia не найден"
+        results["WireGuard"] = 0
+        logger.debug("⚠️ Контейнер amnezia не найден, пропускаем подсчёт WG")
 
         # 2. Выполняем wg show внутри контейнера
         result = subprocess.run(
@@ -1721,7 +1721,7 @@ def count_online_clients(file_paths):
                     continue
         results["WireGuard"] = online_wg
     except Exception as e:
-        logger.error(f"❌ Ошибка подсчёта клиентов WireGuard: {e}")
+        logger.debug(f"❌ Ошибка подсчёта клиентов WireGuard: {e}")
         results["WireGuard"] = 0
     
     # Подсчёт OpenVPN
@@ -1736,7 +1736,6 @@ def count_online_clients(file_paths):
             continue
 
     results["OpenVPN"] = total_openvpn
-#    logger.debug(f"📊 Онлайн клиенты: OVPN={results['OpenVPN']}")
     logger.debug(f"📊 Онлайн клиенты: WG={results['WireGuard']}, OVPN={results['OpenVPN']}")
     return results
 
