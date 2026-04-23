@@ -10,7 +10,6 @@ services:
     volumes:
       - /root/openvpn-status/src/data:/root/web/src/data # Монтирование папки с базами данных
       - /root/antizapret/config/openvpn:/root/web/openvpn #Монтирование папки OpenVPN
-      - /root/antizapret/config/wireguard_amnezia:/root/web/awg #Монтирование папки Amnesia Wireguard
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - PORT=1235

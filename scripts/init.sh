@@ -699,7 +699,7 @@ add_vnstat_iface() {
 # 1. Добавляем физические интерфейсы (eth, ens)
 echo -e "${YELLOW}🔍 Поиск физических интерфейсов...${RESET}"
 for iface in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|ens)'); do
-    add_vnstat_iface "$iface" ""
+    add_vnstat_iface "$iface" "Host"
 done
 
 # 2. Добавляем veth-интерфейсы контейнеров Amnezia/OpenVPN (УНИВЕРСАЛЬНАЯ ВЕРСИЯ)

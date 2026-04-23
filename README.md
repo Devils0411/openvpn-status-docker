@@ -80,6 +80,7 @@ services:
 git pull
 docker compose down --remove-orphans
 docker compose up -d --remove-orphans
+docker system prune -af
 ```
 
 # Cмена пароля

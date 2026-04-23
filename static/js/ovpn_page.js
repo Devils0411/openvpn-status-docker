@@ -103,7 +103,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (client.download_speed && client.download_speed !== "-") {
             const sp = document.createElement("span");
             sp.className = "ovpn-speed";
-            sp.textContent = `↓ ${client.download_speed}`;
+            sp.textContent = `↑ ${client.download_speed}`;
             tdRec.appendChild(sp);
         }
         tr.appendChild(tdRec);
@@ -114,7 +114,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (client.upload_speed && client.upload_speed !== "-") {
             const sp = document.createElement("span");
             sp.className = "ovpn-speed";
-            sp.textContent = `↑ ${client.upload_speed}`;
+            sp.textContent = `↓ ${client.upload_speed}`;
             tdSent.appendChild(sp);
         }
         tr.appendChild(tdSent);
@@ -254,7 +254,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (data.total_download_speed && data.total_download_speed !== '0.00 B/s') {
                 const sp = document.createElement('span');
                 sp.className = 'ovpn-speed';
-                sp.textContent = '\u2009\u2193 ' + data.total_download_speed;
+                sp.textContent = '\u2009\u2191 ' + data.total_download_speed;
                 recvEl.appendChild(sp);
             }
         }
@@ -264,7 +264,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (data.total_upload_speed && data.total_upload_speed !== '0.00 B/s') {
                 const sp = document.createElement('span');
                 sp.className = 'ovpn-speed';
-                sp.textContent = '\u2009\u2191 ' + data.total_upload_speed;
+                sp.textContent = '\u2009\u2193 ' + data.total_upload_speed;
                 sentEl.appendChild(sp);
             }
         }

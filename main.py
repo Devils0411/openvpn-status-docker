@@ -14,7 +14,7 @@ import socket
 import subprocess
 import json
 import shutil
-import json
+import docker
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -752,34 +752,209 @@ def change_admin_password_2(new_password):
     logger.info(f"✅ Пароль администратора успешно изменён")
 
 
-# ---------WireGuard----------
-# Функция для получения данных WireGuard
-def get_wireguard_stats():
-    try:
-        # 1. Получаем ID контейнера
-        id_result = subprocess.run(
-            ['docker', 'ps', '--filter', 'name=amnezia', '--format', '{{.ID}}'],
-            capture_output=True, text=True, check=True
-        )
-        container_id = id_result.stdout.strip().splitlines()[0] if id_result.stdout.strip() else None
-        
-        if not container_id:
-            return "Ошибка: Контейнер amnezia не найден"
+# =============================================================================
+# HEALTH CHECK ДЛЯ AMNEZIA API
+# =============================================================================
+_API_HEALTH = {
+    "available": True,
+    "last_check": 0,
+    "fail_count": 0,
+    "lock": threading.Lock(),
+    "COOLDOWN": 30,      # Не проверять чаще 30 сек при ошибке
+    "MAX_FAILS": 3,      # После 3 ошибок — помечаем как недоступный
+    "RETRY_AFTER": 120,  # Пробовать снова через 120 сек
+}
 
-        # 2. Выполняем wg show внутри контейнера
-        result = subprocess.run(
-            ['docker', 'exec', container_id, '/usr/bin/wg', 'show'],
-            capture_output=True, text=True, check=True
+class AmneziaHealthChecker:
+    @staticmethod
+    def is_api_available() -> bool:
+        """Быстрая проверка кэшированного состояния."""
+        with _API_HEALTH["lock"]:
+            now = time.time()
+            # Если помечен как недоступный — ждём RETRY_AFTER
+            if not _API_HEALTH["available"]:
+                if now - _API_HEALTH["last_check"] < _API_HEALTH["RETRY_AFTER"]:
+                    return False
+                # Время вышло — сбрасываем для повторной проверки
+                _API_HEALTH["available"] = True
+                _API_HEALTH["fail_count"] = 0
+            
+            # Если недавно проверяли — возвращаем кэш
+            if now - _API_HEALTH["last_check"] < _API_HEALTH["COOLDOWN"]:
+                return _API_HEALTH["available"]
+            
+            return True
+    
+    @staticmethod
+    def record_success():
+        with _API_HEALTH["lock"]:
+            _API_HEALTH["available"] = True
+            _API_HEALTH["fail_count"] = 0
+            _API_HEALTH["last_check"] = time.time()
+    
+    @staticmethod
+    def record_failure():
+        with _API_HEALTH["lock"]:
+            _API_HEALTH["fail_count"] += 1
+            _API_HEALTH["last_check"] = time.time()
+            if _API_HEALTH["fail_count"] >= _API_HEALTH["MAX_FAILS"]:
+                _API_HEALTH["available"] = False
+                logger.warning(f"⚠️ API Amnezia помечен как недоступный (ошибок: {_API_HEALTH['fail_count']})")
+
+
+# =============================================================================
+# Amnezia WG Easy API Client & Sync
+# =============================================================================
+class AmneziaDiscoverer:
+    @staticmethod
+    def get_connection_info():
+        try:
+            client = docker.from_env()
+            for container in client.containers.list():
+                if "amnezia" in container.name.lower():
+                    nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                    ip = next((net.get("IPAddress") for net in nets.values() if net.get("IPAddress")), None)
+                    if not ip: continue
+                    password = port = None
+                    for env in container.attrs.get("Config", {}).get("Env", []):
+                        if env.startswith("WIREGUARD_PASSWORD="):
+                            password = env.split("=", 1)[1].strip()
+                        elif env.startswith("PORT="):
+                            port = env.split("=", 1)[1].strip()
+                    if ip and password:
+                        return ip, password, port or "8080"
+        except Exception as e:
+            logger.error(f"❌ Ошибка обнаружения контейнера Amnezia: {e}")
+        return None
+
+class AmneziaApiSyncClient:
+    def __init__(self, base_url: str, password: str):
+        self.base_url = base_url.rstrip("/")
+        self.password = password
+        self.session = requests.Session()
+
+    def login(self):
+        resp = self.session.post(
+            f"{self.base_url}/api/session",
+            json={"password": self.password, "remember": True},
+            headers={"Content-Type": "application/json"}
         )
-        logger.debug("✅ Команда wg show выполнена успешно через Docker")
-        return result.stdout
+        resp.raise_for_status()
+
+    def get_clients(self):
+        resp = self.session.get(
+            f"{self.base_url}/api/wireguard/client",
+            headers={"Accept": "application/json"}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+def _fetch_wg_api_data():
+    """Возвращает данные через API. Если API недоступен — возвращает None без ошибок."""
+    # Быстрая проверка доступности
+    if not AmneziaHealthChecker.is_api_available():
+        return None
+    
+    conn_info = AmneziaDiscoverer.get_connection_info()
+    if not conn_info:
+        AmneziaHealthChecker.record_failure()
+        return None
+    
+    ip, password, port = conn_info
+    try:
+        api = AmneziaApiSyncClient(f"http://{ip}:{port}", password)
+        api.login()
+        clients = api.get_clients()
+        daily_map = get_daily_stats_map()
+        peers = []
         
-    except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Ошибка Docker/wg: {e.stderr}")
-        return f"Ошибка выполнения команды: {e.stderr}"
+        for c in clients:
+            peer_key = c.get("publicKey") or c.get("id", "")
+            name = c.get("name", "N/A")
+            address = c.get("address", "N/A")
+            enabled = c.get("enabled", True)
+            rx = int(c.get("transferRx") or c.get("transfer_rx", 0))
+            tx = int(c.get("transferTx") or c.get("transfer_tx", 0))
+            last_hs = c.get("latestHandshakeAt")
+
+            raw_endpoint = c.get("endpoint") or ""
+            if raw_endpoint and ":" in raw_endpoint:
+                if raw_endpoint.startswith("["):
+                    endpoint_ip = raw_endpoint.split("]")[0].lstrip("[")
+                else:
+                    endpoint_ip = raw_endpoint.rsplit(":", 1)[0]
+                endpoint_ip = endpoint_ip.strip()
+            else:
+                endpoint_ip = raw_endpoint.strip() if raw_endpoint else "N/A"
+            if not endpoint_ip:
+                endpoint_ip = "N/A"
+            
+            online = False
+            if last_hs:
+                try:
+                    ts = last_hs.replace("Z", "+00:00")
+                    hs_dt = datetime.fromisoformat(ts)
+                    if (datetime.now(timezone.utc) - hs_dt) < timedelta(minutes=3):
+                        online = True
+                except Exception:
+                    pass
+                    
+            daily = daily_map.get((peer_key, "wg0"))
+            daily_rx = daily["received"] if daily else 0
+            daily_tx = daily["sent"] if daily else 0
+            total = rx + tx
+            daily_total = daily_rx + daily_tx
+            
+            peers.append({
+                "peer": peer_key,
+                "masked_peer": peer_key[:4] + "..." + peer_key[-4:] if len(peer_key) > 8 else peer_key,
+                "client": name,
+                "assigned_address": address,
+                "endpoint": endpoint_ip,
+                "allowed_ips": [address] if address != "N/A" else [],
+                "visible_ips": [address] if address != "N/A" else [],
+                "hidden_ips": [],
+                "latest_handshake": "Now" if online else "Никогда",
+                "online": online,
+                "received": humanize_bytes(rx),
+                "sent": humanize_bytes(tx),
+                "received_bytes": rx,
+                "sent_bytes": tx,
+                "daily_received": humanize_bytes(daily_rx),
+                "daily_sent": humanize_bytes(daily_tx),
+                "daily_traffic_percentage": round((daily_total / total * 100)) if total > 0 else 0,
+                "received_percentage": round((rx / total * 100), 2) if total > 0 else 0,
+                "sent_percentage": round((tx / total * 100), 2) if total > 0 else 0,
+                "enabled": enabled,
+                "blocked": not enabled
+            })
+        
+        # Успех — сбрасываем счётчик ошибок
+        AmneziaHealthChecker.record_success()
+        return [{"interface": "wg0", "public_key": "N/A", "listening_port": "N/A", "peers": peers}]
+        
+    except requests.exceptions.ConnectionError as e:
+        logger.debug(f"⚠️ API Amnezia недоступен (сеть): {e}")
+        AmneziaHealthChecker.record_failure()
+        return None
+    except requests.exceptions.Timeout as e:
+        logger.debug(f"⚠️ API Amnezia таймаут: {e}")
+        AmneziaHealthChecker.record_failure()
+        return None
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"❌ HTTP ошибка API Amnezia: {e}")
+        AmneziaHealthChecker.record_failure()
+        return None
     except Exception as e:
-        logger.error(f"❌ Исключение: {e}")
-        return f"Ошибка: {str(e)}"
+        logger.error(f"❌ Ошибка API Amnezia WG: {e}")
+        AmneziaHealthChecker.record_failure()
+        return None
+
+def get_wireguard_stats():
+    """Получает статистику WG через API. Если API недоступен — возвращает None."""
+    if not AmneziaHealthChecker.is_api_available():
+        return None
+    return _fetch_wg_api_data()
 
 
 def format_handshake_time(handshake_string):
@@ -967,142 +1142,6 @@ def humanize_bytes(num, suffix="B"):
             return f"{num:.1f} {unit}{suffix}"
         num /= 1024.0
     return f"{num:.1f} P{suffix}"
-
-
-def parse_wireguard_output(output, hide_ip=True):
-    """Парсинг вывода команды wg show с опцией скрытия IP."""
-    stats = []
-    lines = output.strip().splitlines()
-    interface_data = {}
-    client_mapping = read_wg_config("/root/web/awg/wg0.json")
-    daily_stats_map = get_daily_stats_map()
-    
-    for line in lines:
-        line = line.strip()
-        if line.startswith("interface: "):
-            if interface_data:
-                stats.append(interface_data)
-                interface_data = {}
-            interface_data["interface"] = line.split(": ", 1)[1].strip()
-        elif line.startswith("public key: "):
-            public_key = line.split(": ", 1)[1].strip()
-            interface_data["public_key"] = public_key
-        elif line.startswith("listening port: "):
-            interface_data["listening_port"] = line.split(": ", 1)[1].strip()
-        elif line.startswith("peer: "):
-            if "peers" not in interface_data:
-                interface_data["peers"] = []
-            peer_data = {"peer": line.split(": ", 1)[1].strip()}
-            masked_peer = peer_data["peer"][:4] + "..." + peer_data["peer"][-4:]
-            peer_data["masked_peer"] = masked_peer
-            client_info = client_mapping.get(peer_data["peer"], {"name": "N/A", "address": "N/A"})
-            peer_data["client"] = client_info["name"]
-            peer_data["assigned_address"] = client_info["address"]
-
-            daily_row = daily_stats_map.get(
-                (peer_data["peer"], interface_data["interface"])
-            )
-            if daily_row:
-                peer_data["daily_received"] = humanize_bytes(daily_row["received"])
-                peer_data["daily_sent"] = humanize_bytes(daily_row["sent"])
-                try:
-                    total = parse_bytes(peer_data["received"]) + parse_bytes(
-                        peer_data["sent"]
-                    )
-                    daily_total = daily_row["received"] + daily_row["sent"]
-                    round_res = round((daily_total / total * 100) if total > 0 else 0)
-                    peer_data["daily_traffic_percentage"] = round_res
-                except Exception:
-                    peer_data["daily_traffic_percentage"] = 0
-            else:
-                peer_data["daily_received"] = "0 B"
-                peer_data["daily_sent"] = "0 B"
-                peer_data["daily_traffic_percentage"] = 0
-            interface_data["peers"].append(peer_data)
-        elif line.startswith("endpoint:"):
-            parts = line.split(":", 1)
-            raw_endpoint = parts[1].strip() if len(parts) > 1 else ""
-            ip_only = raw_endpoint.rsplit(":", 1)[0].strip("[] ") if raw_endpoint else ""
-            peer_data["endpoint"] = mask_ip(ip_only, hide=hide_ip)
-        elif line.startswith("allowed ips: "):
-            if ": " in line:
-                ips_part = line.split(": ", 1)[1].strip()
-                allowed_ips = [ip.strip() for ip in ips_part.split(", ") if ip.strip()]
-            else:
-                allowed_ips = []
-            peer_data["allowed_ips"] = allowed_ips
-            peer_data["visible_ips"] = allowed_ips[:1]
-            peer_data["hidden_ips"] = allowed_ips[1:]
-        elif line.startswith("latest handshake: "):
-            parts = line.split(":", 1)
-            handshake_time = parts[1].strip() if len(parts) > 1 else ""
-
-            if not handshake_time:
-                peer_data["latest_handshake"] = "Никогда"
-                peer_data["online"] = False
-            elif handshake_time.lower() == "now":
-                formatted_handshake_time = datetime.now()
-                peer_data["latest_handshake"] = "Now"
-                peer_data["online"] = True
-            elif any(
-                unit in handshake_time
-                for unit in ["мин", "час", "сек", "minute", "hour", "second", "day", "week", "год", "year"]
-            ):
-                try:
-                    formatted_handshake_time = parse_relative_time(handshake_time)
-                    peer_data["latest_handshake"] = format_handshake_time(handshake_time)
-                    peer_data["online"] = is_peer_online(formatted_handshake_time)
-                except Exception:
-                    peer_data["latest_handshake"] = handshake_time
-                    peer_data["online"] = False
-            else:
-                try:
-                    formatted_handshake_time = datetime.strptime(
-                        handshake_time, "%Y-%m-%d %H:%M:%S"
-                    )
-                    peer_data["latest_handshake"] = format_handshake_time(handshake_time)
-                    peer_data["online"] = is_peer_online(formatted_handshake_time)
-                except ValueError:
-                    peer_data["latest_handshake"] = handshake_time
-                    peer_data["online"] = False
-        elif line.startswith("transfer: "):
-            if ": " in line:
-                transfer_part = line.split(": ", 1)[1].strip()
-                transfer_data = [p.strip() for p in transfer_part.split(", ")]
-            else:
-                transfer_data = []
-            received = transfer_data[0].replace(" received", "").strip() if len(transfer_data) > 0 else "0 B"
-            sent = transfer_data[1].replace(" sent", "").strip() if len(transfer_data) > 1 else "0 B"
-
-            received_str = transfer_data[0].replace(" received", "").strip()
-            sent_str = transfer_data[1].replace(" sent", "").strip()
-
-            # Конвертируем строки в байты
-            peer_data["received_bytes"] = (
-                parse_bytes(received_str) if received_str else 0
-            )
-            peer_data["sent_bytes"] = parse_bytes(sent_str) if sent_str else 0
-
-            peer_data["received"] = received if received else "0 B"
-            peer_data["sent"] = sent if sent else "0 B"
-
-            total_bytes = peer_data["received_bytes"] + peer_data["sent_bytes"]
-            peer_data["received_percentage"] = (
-                round((peer_data["received_bytes"] / total_bytes * 100), 2)
-                if total_bytes > 0
-                else 0
-            )
-            peer_data["sent_percentage"] = (
-                round((peer_data["sent_bytes"] / total_bytes * 100), 2)
-                if total_bytes > 0
-                else 0
-            )
-
-    if interface_data:
-        stats.append(interface_data)
-
-    logger.debug(f"✅ Распарсено {len(stats)} интерфейсов WireGuard")
-    return stats
 
 
 def get_daily_stats():
@@ -1601,6 +1640,10 @@ def get_network_load():
     vnstat_interfaces = get_vnstat_interfaces()
     alias_map = {iface['name']: iface['alias'] for iface in vnstat_interfaces}
     for interface in net_io_start:
+        # Интерфейс должен существовать в обоих снимках
+        if interface not in net_io_end:
+            logger.debug(f"⚠️ Интерфейс {interface} исчез между снимками — пропускаем")
+            continue
         # Получаем алиас интерфейса (если есть)
         alias = alias_map.get(interface, interface)
         # Проверяем, является ли интерфейс исключением (содержит amnezia или openvpn-1 в алиасе)
@@ -1688,42 +1731,17 @@ def count_online_clients(file_paths):
     total_openvpn = 0
     results = {}
 
-    # Подсчёт WireGuard
+    # Подсчёт WireGuard (строго через API, без fallback)
     try:
-        id_result = subprocess.run(
-            ['docker', 'ps', '--filter', 'name=amnezia', '--format', '{{.ID}}'],
-            capture_output=True, text=True, check=True
-        )
-        container_id = id_result.stdout.strip().splitlines()[0] if id_result.stdout.strip() else None
-        
-        results["WireGuard"] = 0
-        logger.debug("⚠️ Контейнер amnezia не найден, пропускаем подсчёт WG")
-
-        # 2. Выполняем wg show внутри контейнера
-        result = subprocess.run(
-            ['docker', 'exec', container_id, '/usr/bin/wg', 'show'],
-            capture_output=True, text=True, check=True
-        )
-        wg_output = result.stdout
-        wg_latest_handshakes = re.findall(r"latest handshake: (.+)", wg_output)
-        online_wg = 0
-        for handshake in wg_latest_handshakes:
-            handshake_str = handshake.strip()
-            if handshake_str == "0 seconds ago":
-                online_wg += 1
-            else:
-                try:
-                   # Используем parse_relative_time и is_peer_online для определения онлайн-статуса
-                    handshake_time = parse_relative_time(handshake_str)
-                    if is_peer_online(handshake_time):
-                        online_wg += 1
-                except Exception:
-                    continue
-        results["WireGuard"] = online_wg
+        wg_data = _fetch_wg_api_data()
+        if wg_data:
+            results["WireGuard"] = sum(1 for p in wg_data[0]["peers"] if p.get("online"))
+        else:
+            results["WireGuard"] = 0
     except Exception as e:
         logger.debug(f"❌ Ошибка подсчёта клиентов WireGuard: {e}")
         results["WireGuard"] = 0
-    
+
     # Подсчёт OpenVPN
     for path, _ in file_paths:
         try:
@@ -1738,6 +1756,7 @@ def count_online_clients(file_paths):
     results["OpenVPN"] = total_openvpn
     logger.debug(f"📊 Онлайн клиенты: WG={results['WireGuard']}, OVPN={results['OpenVPN']}")
     return results
+
 
 # Метрики для статистики скорости для активных пользователей OpenVPN
 def ensure_ovpn_stats_db():
@@ -2563,16 +2582,19 @@ def api_system_info():
 @login_required
 def wg():
     hide_wg_ip = read_settings().get("hide_wg_ip", True)
-    stats = parse_wireguard_output(get_wireguard_stats(), hide_ip=hide_wg_ip)
+    stats = get_wireguard_stats()
+    # Если API недоступен, передаём пустой список, чтобы шаблон не ломался
+    if stats is None:
+        stats = [{"interface": "wg0", "public_key": "N/A", "listening_port": "N/A", "peers": []}]
+        
     disabled_peers = get_disabled_wg_peers()
-    
     for interface_data in stats:
         for peer in interface_data.get("peers", []):
             peer["enabled"] = True
         iface = interface_data.get("interface")
         if iface in disabled_peers:
             interface_data.setdefault("peers", []).extend(disabled_peers[iface])
-    
+
     logger.debug(f"📄 Запрошена страница WireGuard пользователем {current_user.username}")
     return render_template("wg/wg.html", stats=stats, active_section="wg", active_page="wg_clients")
 
@@ -2588,10 +2610,11 @@ def wg_client_status():
 @login_required
 def api_wg_stats():
     try:
-        hide_wg_ip = read_settings().get("hide_wg_ip", True)
-        stats = parse_wireguard_output(get_wireguard_stats(), hide_ip=hide_wg_ip)
+        stats = get_wireguard_stats()
+        if stats is None:
+            stats = [{"interface": "wg0", "public_key": "N/A", "listening_port": "N/A", "peers": []}]
+            
         disabled_peers = get_disabled_wg_peers()
-        
         for interface_data in stats:
             for peer in interface_data.get("peers", []):
                 peer["enabled"] = True
