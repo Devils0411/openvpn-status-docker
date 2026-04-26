@@ -23,7 +23,6 @@ ENV_FILE="$ROOT_DIR/src/data/.env"
 SERVICE_FILE="/etc/supervisord.conf"
 VNSTAT_CONF_FILE="/etc/vnstat.conf"
 NEW_DATABASE_DIR="$DB_DIR/vnstat"
-WORKER_COUNT=2
 
 # ==========================================
 # Автоматические параметры (ENV)
@@ -34,6 +33,7 @@ DOMAIN_NAME=${DOMAIN_NAME:-""}
 BOT_ON=${BOT_ON:-"N"}
 BOT_TOKEN=${BOT_TOKEN:-""}
 ADMIN_ID=${ADMIN_ID:-""}
+WORKER_COUNT=${WORKER_COUNT:-"2"}
 
 # ==========================================
 # Определение IP-адреса сервера

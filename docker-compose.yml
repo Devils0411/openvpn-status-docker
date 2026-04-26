@@ -15,4 +15,5 @@ services:
       - PORT=1235
       - ADMIN_USERNAME=admin
       - ADMIN_PASSWORD=admin
+      - WORKER_COUNT=2
     restart: unless-stopped
