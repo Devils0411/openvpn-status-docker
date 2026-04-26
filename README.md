@@ -31,7 +31,7 @@
   <summary>Версия от 26.04.2026</summary>
 
 ### OpenVPN-Status
-1. Добавлена переменная WORKER_COUNT (по умолчанию = 2) для запуска Gunicoin.
+1. Добавлена переменная WORKER_COUNT (по умолчанию = 2) для запуска [Gunicoin](https://gunicorn.org/reference/settings/#workers).
 2. Исправлены мелкие недочеты.
 </details>
 
