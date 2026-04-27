@@ -2667,7 +2667,7 @@ def ovpn_stats():
             label = dt_value.strftime("%d.%m.%Y")
             return f"{label} (сегодня)" if dt_value.date() == today else label
 
-        allowed_sorts = {"client_name": "client_name", "total_bytes_sent": "SUM(total_bytes_received)", "total_bytes_received": "SUM(total_bytes_sent)", "last_connected": "MAX(last_connected)"}
+        allowed_sorts = {"client_name": "client_name", "client_bytes_sent": "SUM(total_bytes_received)", "client_bytes_received": "SUM(total_bytes_sent)", "last_connected": "MAX(last_connected)"}
         sort_column = allowed_sorts.get(sort_by, "client_name")
         order_sql = "DESC" if order == "desc" else "ASC"
 
