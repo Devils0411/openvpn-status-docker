@@ -72,6 +72,7 @@ DB_PATH = Config.LOGS_DATABASE_PATH
 SETTINGS_PATH = Config.SETTINGS_PATH
 LOG_FILES = Config.LOG_FILES
 LOCAL_TZ = get_localzone()  # Кэшируем часовой пояс один раз
+HISTORY_MAX_RECORDS_DEFAULT = 1000
 
 def get_stats_retention_days(default_days=365):
     try:
@@ -81,6 +82,25 @@ def get_stats_retention_days(default_days=365):
             return max(30, min(days, 3650))
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         return default_days
+
+def parse_history_max_records(raw_value, default=HISTORY_MAX_RECORDS_DEFAULT):
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(100, min(value, 100000))
+
+
+def get_history_max_records(default=HISTORY_MAX_RECORDS_DEFAULT):
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
+            settings_data = json.load(settings_file)
+        return parse_history_max_records(
+            settings_data.get("history_max_records", default),
+            default=default,
+        )
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        return default
 
 def get_retention_windows(total_days):
     hourly_days = max(1, round(total_days * 30 / 365))
@@ -389,6 +409,15 @@ def cleanup_old_stats(total_days=None):
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         now = datetime.today()
+        max_records = get_history_max_records()
+        cursor.execute("""
+            DELETE FROM connection_logs 
+            WHERE id < (
+                SELECT MIN(id) FROM (
+                    SELECT id FROM connection_logs ORDER BY id DESC LIMIT ?
+                )
+            )
+        """, (max_records,))
         cutoffs = [
             ("daily_stats", "hour", now - timedelta(days=hourly_days), "%Y-%m-%d %H:00"),
             ("monthly_stats", "month", now - timedelta(days=daily_days), "%Y-%m-%d"),

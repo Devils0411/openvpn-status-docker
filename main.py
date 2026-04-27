@@ -274,9 +274,12 @@ DEFAULT_SETTINGS = {
     "app_name": "OpenVPN-Status",
     "telegram_admins": {},
     "bot_enabled": False,
+    "show_ovpn_menu": True,
+    "show_wg_menu": True,
     "hide_ovpn_ip": True,
     "hide_wg_ip": True,
     "stats_retention_days": 365,
+    "history_max_records": 1000,
 }
 
 MONTH_OPTIONS_RU = [
@@ -352,6 +355,14 @@ def parse_stats_retention_days(raw_value):
 
 def get_stats_retention_days():
     return parse_stats_retention_days(read_settings().get("stats_retention_days", 365))
+
+
+def parse_history_max_records(raw_value):
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return 1000
+    return max(100, min(value, 100000))
 
 
 def get_available_stat_years(db_path, table_name, date_column):
@@ -1852,13 +1863,19 @@ def get_docker_hub_version():
 
 @app.context_processor
 def inject_info():
-    app_name = read_settings().get("app_name", "OpenVPN-Status")
+    settings_data = read_settings()
+    app_name = settings_data.get("app_name", "OpenVPN-Status")
+    show_ovpn_menu = bool(settings_data.get("show_ovpn_menu", True))
+    show_wg_menu = bool(settings_data.get("show_wg_menu", True))
     return {
         "hostname": socket.gethostname(),
         "server_ip": get_external_ip(),
         "version": get_docker_hub_version(),
         "base_path": request.script_root or "",
         "app_name": app_name,
+        "show_ovpn_menu": show_ovpn_menu,
+        "show_wg_menu": show_wg_menu,
+        "host_os_label": HOST_STATIC_INFO["os_label"],
     }
 
 
@@ -1880,10 +1897,13 @@ def settings():
         form_type = request.form.get("form_type")
         if form_type == "settings_all":
             app_name = request.form.get("app_name", "").strip()
+            show_ovpn_menu = request.form.get("show_ovpn_menu") == "on"
+            show_wg_menu = request.form.get("show_wg_menu") == "on"
             hide_ovpn_ip = request.form.get("hide_ovpn_ip") == "on"
             hide_wg_ip = request.form.get("hide_wg_ip") == "on"
             retention_days = parse_stats_retention_days(request.form.get("stats_retention_days", "365"))
-            write_settings({"app_name": app_name, "hide_ovpn_ip": hide_ovpn_ip, "hide_wg_ip": hide_wg_ip, "stats_retention_days": retention_days})
+            history_max_records = parse_history_max_records(request.form.get("history_max_records", "1000"))
+            write_settings({"app_name": app_name, "show_ovpn_menu": show_ovpn_menu, "show_wg_menu": show_wg_menu, "hide_ovpn_ip": hide_ovpn_ip, "hide_wg_ip": hide_wg_ip, "stats_retention_days": retention_days, "history_max_records": history_max_records})
             settings_message = "Настройки сохранены."
         elif form_type == "stats_db_clear_ovpn":
             phrase = (request.form.get("confirm_phrase") or "").strip()
@@ -1915,15 +1935,26 @@ def settings():
                     stats_db_error = f"Ошибка очистки WireGuard: {err}"
 
     settings_data = read_settings()
+    current_app_name = settings_data.get("app_name", "OpenVPN-Status")
+    show_ovpn_menu = bool(settings_data.get("show_ovpn_menu", True))
+    show_wg_menu = bool(settings_data.get("show_wg_menu", True))
+    hide_ovpn_ip = settings_data.get("hide_ovpn_ip", True)
+    hide_wg_ip = settings_data.get("hide_wg_ip", True)
+    stats_retention_days = parse_stats_retention_days(settings_data.get("stats_retention_days", 365))
+    history_max_records = parse_history_max_records(settings_data.get("history_max_records", 1000))
+
     stats_db_items, stats_db_total_bytes = get_ovpn_wg_database_sizes()
     return render_template(
         "settings/settings.html",
-        app_name=settings_data.get("app_name", "StatusOpenVPN"),
+        app_name=settings_data.get("app_name", "OpenVPN-Status"),
+        show_ovpn_menu=show_ovpn_menu,
+        show_wg_menu=show_wg_menu,
         hide_ovpn_ip=settings_data.get("hide_ovpn_ip", True),
         hide_wg_ip=settings_data.get("hide_wg_ip", True),
         settings_message=settings_message,
         settings_error=settings_error,
         stats_retention_days=parse_stats_retention_days(settings_data.get("stats_retention_days", 365)),
+        history_max_records=history_max_records,
         stats_db_items=stats_db_items,
         stats_db_total_fmt=format_bytes(stats_db_total_bytes),
         stats_db_message=stats_db_message,
@@ -2103,7 +2134,8 @@ def api_system_info():
 @app.route("/wg")
 @login_required
 def wg():
-    hide_wg_ip = read_settings().get("hide_wg_ip", True)
+    settings_data = read_settings()
+    hide_wg_ip = settings_data.get("hide_wg_ip", True)
     stats = get_wireguard_stats()
     if stats is None:
         stats = [{"interface": "wg0", "public_key": "N/A", "listening_port": "N/A", "peers": []}]
@@ -2210,26 +2242,28 @@ def wg_stats():
             selected_date_to = date_from
             interval_label = f"за {format_period_date(now)}"
         elif period == "week":
-            week_start = now - timedelta(days=7)
+            week_start = now - timedelta(days=now.weekday())
+            week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
             date_from = week_start.strftime("%Y-%m-%d")
             date_to = None
             selected_date_from = date_from
             selected_date_to = now.strftime("%Y-%m-%d")
             interval_label = f"с {format_period_date(week_start)} по {format_period_date(now)}"
         elif period == "month":
-            month_start = now - timedelta(days=30)
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             date_from = month_start.strftime("%Y-%m-%d")
             date_to = None
             selected_date_from = date_from
             selected_date_to = now.strftime("%Y-%m-%d")
-            interval_label = f"с {format_period_date(month_start)} по {format_period_date(now)}"
+            month_name = dict(MONTH_OPTIONS_RU).get(month_start.month, month_start.strftime("%m"))
+            interval_label = f"{month_name} {month_start.year}"
         elif period == "year":
-            year_start = now - timedelta(days=365)
+            year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
             date_from = year_start.strftime("%Y-%m-%d")
             date_to = None
             selected_date_from = date_from
             selected_date_to = now.strftime("%Y-%m-%d")
-            interval_label = f"с {format_period_date(year_start)} по {format_period_date(now)}"
+            interval_label = str(year_start.year)
         elif period == "custom":
             date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
             date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
@@ -2278,7 +2312,7 @@ def wg_stats():
                 """
                 rows = conn.execute(query, (start_hour, end_hour)).fetchall()
             elif period == "year":
-                year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+                year_month_from = year_start.strftime("%Y-%m")
                 query = f"""
                     SELECT client,
                            SUM(received) as total_received,
@@ -2574,28 +2608,45 @@ def ovpn():
 @app.route("/ovpn/history")
 @login_required
 def ovpn_history():
+    q = (request.args.get("q") or "").strip()
+    conn_logs = None
     try:
         page = request.args.get("page", 1, type=int)
         per_page = 20
         conn_logs = sqlite3.connect(app.config["LOGS_DATABASE_PATH"])
-        total_count = conn_logs.execute("SELECT COUNT(*) FROM connection_logs WHERE client_name != 'UNDEF'").fetchone()[0]
+        filter_clause = "client_name != 'UNDEF'"
+        filter_params = []
+        if q:
+            like_value = f"%{q.lower()}%"
+            filter_clause += (
+                " AND (lower(client_name) LIKE ? OR lower(real_ip) LIKE ? "
+                "OR lower(local_ip) LIKE ? OR lower(protocol) LIKE ?)"
+            )
+            filter_params.extend([like_value, like_value, like_value, like_value])
+        total_count = conn_logs.execute(
+            f"SELECT COUNT(*) FROM connection_logs WHERE {filter_clause}",
+            filter_params
+        ).fetchone()[0]
         total_pages = max(1, (total_count + per_page - 1) // per_page)
         page = max(1, min(page, total_pages))
         offset = (page - 1) * per_page
-        logs_reader = conn_logs.execute("SELECT * FROM connection_logs WHERE client_name != 'UNDEF' ORDER BY connected_since DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
-        conn_logs.close()
+        logs_reader = conn_logs.execute(
+            f"SELECT * FROM connection_logs WHERE {filter_clause} ORDER BY connected_since DESC LIMIT ? OFFSET ?",
+            (*filter_params, per_page, offset)
+        ).fetchall()
         hide_ovpn_ip = read_settings().get("hide_ovpn_ip", True)
-
         def format_ip(ip):
             real_ip = normalize_real_address(ip) if "normalize_real_address" in globals() else ip
             return mask_ip(real_ip, hide=hide_ovpn_ip)
-
         logs = [{"client_name": row[1], "real_ip": format_ip(row[3]), "local_ip": row[2], "connection_since": row[4], "protocol": row[7]} for row in logs_reader]
         logger.debug(f"Запрошена история OpenVPN ({len(logs)} записей, страница {page})")
-        return render_template("ovpn/ovpn_history.html", active_section="ovpn", active_page="history", logs=logs, page=page, total_pages=total_pages)
+        return render_template("ovpn/ovpn_history.html", active_section="ovpn", active_page="history", logs=logs, page=page, total_pages=total_pages, q=q)
     except Exception as e:
-        logger.error(f"Ошибка на странице истории OpenVPN: {e}")
-        return render_template("ovpn/ovpn_history.html", error_message=f"Произошла непредвиденная ошибка: {str(e)}"), 500
+        logger.error(f"Ошибка на странице истории OpenVPN: {e}", exc_info=True)
+        return render_template("ovpn/ovpn_history.html", error_message="Произошла ошибка при загрузке данных.", q=q), 500
+    finally:
+        if conn_logs:
+            conn_logs.close()
 
 
 @app.route("/ovpn/stats")
@@ -2603,6 +2654,7 @@ def ovpn_history():
 def ovpn_stats():
     try:
         sort_by = request.args.get("sort", "client_name")
+        sort_by = {"total_bytes_sent": "client_bytes_sent", "total_bytes_received": "client_bytes_received",}.get(sort_by, sort_by)
         order = request.args.get("order", "asc").lower()
         period = request.args.get("period", "day")
         client_tz, selected_tz = resolve_client_timezone()
@@ -2625,23 +2677,28 @@ def ovpn_stats():
             selected_date_from = selected_date_to = date_from
             interval_label = f"за {format_period_date(now)}"
         elif period == "week":
-            week_start = now - timedelta(days=7)
+            week_start = now - timedelta(days=now.weekday())
+            week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
             date_from = week_start.strftime("%Y-%m-%d")
+            date_to = None
             selected_date_from = date_from
             selected_date_to = now.strftime("%Y-%m-%d")
             interval_label = f"с {format_period_date(week_start)} по {format_period_date(now)}"
         elif period == "month":
-            month_start = now - timedelta(days=30)
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             date_from = month_start.strftime("%Y-%m-%d")
+            date_to = None
             selected_date_from = date_from
             selected_date_to = now.strftime("%Y-%m-%d")
-            interval_label = f"с {format_period_date(month_start)} по {format_period_date(now)}"
+            month_name = dict(MONTH_OPTIONS_RU).get(month_start.month, month_start.strftime("%m"))
+            interval_label = f"{month_name} {month_start.year}"
         elif period == "year":
-            year_start = now - timedelta(days=365)
+            year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
             date_from = year_start.strftime("%Y-%m-%d")
+            date_to = None
             selected_date_from = date_from
             selected_date_to = now.strftime("%Y-%m-%d")
-            interval_label = f"с {format_period_date(year_start)} по {format_period_date(now)}"
+            interval_label = str(year_start.year)
         elif period == "custom":
             date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
             date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
@@ -2675,8 +2732,8 @@ def ovpn_stats():
                 start_hour, end_hour = get_server_hour_window_for_client_day(target_date, client_tz)
                 query = f"""
                     SELECT client_name,
-                           SUM(total_bytes_sent),
                            SUM(total_bytes_received),
+                           SUM(total_bytes_sent),
                            MAX(last_connected)
                     FROM daily_stats
                     WHERE hour >= ? AND hour < ?
@@ -2685,11 +2742,11 @@ def ovpn_stats():
                 """
                 rows = conn.execute(query, (start_hour, end_hour)).fetchall()
             elif period == "year":
-                year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+                year_month_from = year_start.strftime("%Y-%m")
                 query = f"""
                     SELECT client_name,
-                           SUM(total_bytes_sent),
                            SUM(total_bytes_received),
+                           SUM(total_bytes_sent),
                            MAX(last_connected)
                     FROM years_stats
                     WHERE month >= ?
@@ -2700,8 +2757,8 @@ def ovpn_stats():
             elif date_to:
                 query = f"""
                     SELECT client_name,
-                           SUM(total_bytes_sent),
                            SUM(total_bytes_received),
+                           SUM(total_bytes_sent),
                            MAX(last_connected)
                     FROM monthly_stats
                     WHERE month >= ? AND month < ?
@@ -2712,8 +2769,8 @@ def ovpn_stats():
             else:
                 query = f"""
                     SELECT client_name,
-                           SUM(total_bytes_sent),
                            SUM(total_bytes_received),
+                           SUM(total_bytes_sent),
                            MAX(last_connected)
                     FROM monthly_stats
                     WHERE month >= ?
@@ -2722,14 +2779,18 @@ def ovpn_stats():
                 """
                 rows = conn.execute(query, (date_from,)).fetchall()
 
-            for client_name, sent, received, last_connected in rows:
+            for client_name, received, sent, last_connected in rows:
                 total_received += received or 0
                 total_sent += sent or 0
                 stats_list.append(
                     {
                         "client_name": client_name,
+                        "client_bytes_sent": format_bytes(received),
+                        "client_bytes_received": format_bytes(sent),
                         "total_bytes_sent": format_bytes(received),
                         "total_bytes_received": format_bytes(sent),
+                        "client_bytes_sent_raw": received or 0,
+                        "client_bytes_received_raw": sent or 0,
                         "total_bytes_sent_raw": received or 0,
                         "total_bytes_received_raw": sent or 0,
                         "last_connected": last_connected,
@@ -2738,6 +2799,8 @@ def ovpn_stats():
 
         return render_template(
             "ovpn/ovpn_stats.html",
+            total_client_received=format_bytes(total_sent),
+            total_client_sent=format_bytes(total_received),
             total_received=format_bytes(total_received),
             total_sent=format_bytes(total_sent),
             active_section="ovpn",
@@ -2774,13 +2837,15 @@ def api_ovpn_client_chart():
         selected_date_from = selected_date_to = target_date
         is_single_day = True
     elif period == "week":
-        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        week_start = now - timedelta(days=now.weekday())
+        week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_from = week_start.strftime("%Y-%m-%d")
         date_to = None
     elif period == "month":
-        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        date_from = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d")
         date_to = None
     elif period == "year":
-        year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+        year_month_from = now.replace(month=1, day=1).strftime("%Y-%m")
     elif period == "custom":
         date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
         date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)
@@ -2858,13 +2923,15 @@ def api_wg_client_chart():
         selected_date_from = selected_date_to = target_date
         is_single_day = True
     elif period == "week":
-        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        week_start = now - timedelta(days=now.weekday())
+        week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_from = week_start.strftime("%Y-%m-%d")
         date_to = None
     elif period == "month":
-        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        date_from = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d")
         date_to = None
     elif period == "year":
-        year_month_from = (now - timedelta(days=365)).strftime("%Y-%m")
+        year_month_from = now.replace(month=1, day=1).strftime("%Y-%m")
     elif period == "custom":
         date_from_dt = parse_date_yyyy_mm_dd(selected_date_from)
         date_to_dt = parse_date_yyyy_mm_dd(selected_date_to)

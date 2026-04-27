@@ -28,10 +28,10 @@
   - Добавлена возможность привязки 1 пользователя `telegramID` к нескольким профилям opvn.
 
 <details>
-  <summary>Версия от 26.04.2026</summary>
+  <summary>Версия от 27.04.2026</summary>
 
 ### OpenVPN-Status
-1. Добавлена переменная WORKER_COUNT (по умолчанию = 2) для запуска [Gunicoin](https://gunicorn.org/reference/settings/#workers).
+1. Добавлена переменная WORKER_COUNT (Кол-во ядер * 2 = WORKER_COUNT) для запуска [Gunicoin](https://gunicorn.org/reference/settings/#workers).
 2. Исправлены мелкие недочеты.
 </details>
 
