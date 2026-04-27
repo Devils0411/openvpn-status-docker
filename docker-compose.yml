@@ -1,6 +1,6 @@
 services:
   openvpn-status:
-#    image: devils0411/openvpn-status:latest
+    image: devils0411/openvpn-status:latest
     container_name: openvpn-status
     build:
       context: .
