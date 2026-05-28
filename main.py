@@ -806,7 +806,7 @@ class AmneziaApiSyncClient:
         )
         resp.raise_for_status()
         clients = resp.json()
-
+        return clients if clients is not None else [] 
 
 def _fetch_wg_api_data():
     if not AmneziaHealthChecker.is_api_available():
@@ -821,6 +821,9 @@ def _fetch_wg_api_data():
         api = AmneziaApiSyncClient(f"http://{ip}:{port}", password)
         api.login()
         clients = api.get_clients()
+        if not clients:
+            logger.warning("⚠️ API вернул пустой список клиентов или None")
+            return None
         daily_map = get_daily_stats_map()
         peers = []
 
