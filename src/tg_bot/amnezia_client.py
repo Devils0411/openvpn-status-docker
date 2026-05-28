@@ -3,7 +3,7 @@ import logging
 import re
 import time
 import aiohttp
-from aiohttp import CookieJar
+from aiohttp import CookieJar, BasicAuth
 from typing import Optional, Dict, Any, Tuple
 import docker
 
@@ -17,77 +17,68 @@ _amnezia_cache = {"is_running": None, "ts": 0.0, "ttl": 15}
 class AmneziaClient:
     """Клиент для управления AmneziaWG Easy через API."""
     
-    def __init__(self, base_url: str, password: str):
+    def __init__(self, base_url: str, password: str, username: str = "admin"):
         self.base_url = base_url.rstrip("/")
         self.password = password
+        self.username = username
         self.session: Optional[aiohttp.ClientSession] = None
         
     async def __aenter__(self):
         # 🔑 Ключевое исправление: unsafe=True разрешает сохранение куки для IP-адресов (10.x.x.x)
         self.session = aiohttp.ClientSession(cookie_jar=CookieJar(unsafe=True))
-        await self._login()
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session and not self.session.closed:
             await self.session.close()
             
-    async def _login(self):
-        """Аутентификация в веб-интерфейсе."""
-        async with self.session.post(
-            f"{self.base_url}/api/session",
-            json={"password": self.password, "remember": True},
-            headers={"Content-Type": "application/json"}
-        ) as resp:
-            if resp.status == 200:
-                logger.debug("✅ Успешная аутентификация в AmneziaWG Easy")
-                return
-            error_body = await resp.text()
-            logger.error(f"❌ Ошибка аутентификации {resp.status}: {error_body}")
-            raise RuntimeError(f"Auth failed: {resp.status}. Body: {error_body}")
+    async def _get_auth(self):
+        """Возвращает объект авторизации для запросов."""
+        return BasicAuth(self.username, self.password)
     
     async def create_client(self, name: str, expire_date: Optional[str] = None) -> Dict[str, Any]:
         """Создать нового клиента WireGuard."""
         payload = {"name": name}
         if expire_date:
             payload["expiredDate"] = expire_date
-            
+
         async with self.session.post(
-            f"{self.base_url}/api/wireguard/client",
+            f"{self.base_url}/api/client",
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json"},
+            auth=await self._get_auth()
         ) as resp:
             if resp.status == 200:
                 return await resp.json()
             error_body = await resp.text()
             logger.error(f"❌ Create client failed {resp.status}: {error_body}")
             raise RuntimeError(f"Create client failed: {resp.status}. Body: {error_body}")
-    
+
     async def download_config(self, client_id: str) -> bytes:
         """Скачать конфигурационный файл клиента."""
         async with self.session.get(
-            f"{self.base_url}/api/wireguard/client/{client_id}/configuration"
+            f"{self.base_url}/api/client/{client_id}/configuration",
+            auth=await self._get_auth()
         ) as resp:
             if resp.status == 200:
                 return await resp.read()
             error_body = await resp.text()
             logger.error(f"❌ Download config failed {resp.status}: {error_body}")
             raise RuntimeError(f"Download config failed: {resp.status}. Body: {error_body}")
-    
+
     async def get_clients(self) -> list:
         """Получить список всех клиентов с деталями."""
         async with self.session.get(
-            f"{self.base_url}/api/wireguard/client",
-            headers={"Accept": "application/json", "User-Agent": "AmneziaBot/1.0"}
+            f"{self.base_url}/api/client",
+            headers={"Accept": "application/json", "User-Agent": "AmneziaBot/1.0"},
+            auth=await self._get_auth()
         ) as resp:
             if resp.status == 200:
                 clients = await resp.json()
-                # Нормализуем формат для совместимости с UI бота
                 for client in clients:
                     client.setdefault("expire", "unknown")
                     client.setdefault("name", client.get("id", "unknown"))
                 return clients
-            
             error_body = await resp.text()
             logger.error(f"❌ API Error {resp.status}: {error_body}")
             raise RuntimeError(f"Get clients failed: {resp.status}. Body: {error_body}")
@@ -95,7 +86,8 @@ class AmneziaClient:
     async def delete_client(self, client_id: str) -> bool:
         """Удалить клиента по ID."""
         async with self.session.delete(
-            f"{self.base_url}/api/wireguard/client/{client_id}"
+            f"{self.base_url}/api/client/{client_id}",
+            auth=await self._get_auth()
         ) as resp:
             if resp.status in (200, 204):
                 logger.debug("✅ Клиент %s удалён через API", client_id)
