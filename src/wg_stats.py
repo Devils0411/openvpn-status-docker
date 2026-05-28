@@ -8,6 +8,7 @@ import sqlite3
 import logging
 import docker
 import requests
+from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 import schedule
@@ -87,24 +88,21 @@ class AmneziaDiscoverer:
 
 class AmneziaApiSyncClient:
     """Синхронный клиент для взаимодействия с API AmneziaWG Easy."""
-    def __init__(self, base_url: str, password: str):
+    def __init__(self, base_url: str, password: str, username: str = "admin"):
         self.base_url = base_url.rstrip("/")
         self.password = password
+        self.username = username
         self.session = requests.Session()
+        self.session.auth = HTTPBasicAuth(username, password)
 
     def login(self) -> None:
-        resp = self.session.post(
-            f"{self.base_url}/api/session",
-            json={"password": self.password, "remember": True},
-            headers={"Content-Type": "application/json"}
-        )
+        resp = self.session.get(f"{self.base_url}/api/client")
         resp.raise_for_status()
         logger.debug("✅ Успешная аутентификация в AmneziaWG Easy")
 
     def get_clients_stats(self) -> List[Dict]:
         resp = self.session.get(
-            f"{self.base_url}/api/wireguard/client",
-            headers={"Accept": "application/json"}
+            f"{self.base_url}/api/client",
         )
         resp.raise_for_status()
         clients = resp.json()
@@ -157,12 +155,12 @@ def get_wireguard_stats() -> Optional[List[Dict]]:
     if not conn_info:
         logger.debug("⚠️ Контейнер Amnezia не найден через Docker")
         return None
-
     ip, password, port = conn_info
     base_url = f"http://{ip}:{port}"
-
     try:
-        client = AmneziaApiSyncClient(base_url, password)
+        # Добавляем username (по умолчанию 'admin' или читаем из env)
+        username = os.environ.get("WG_USERNAME", "admin")
+        client = AmneziaApiSyncClient(base_url, password, username)
         client.login()
         return client.get_clients_stats()
     except requests.exceptions.RequestException as e:

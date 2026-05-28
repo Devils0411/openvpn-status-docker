@@ -16,6 +16,7 @@ import json
 import shutil
 import docker
 import logging
+from requests.auth import HTTPBasicAuth
 from logging.handlers import RotatingFileHandler
 from statistics import mean
 from threading import Lock
@@ -48,6 +49,7 @@ from datetime import date, datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from zoneinfo._common import ZoneInfoNotFoundError
 from collections import OrderedDict, defaultdict
+from typing import List, Dict, Optional, Tuple
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 import sys
@@ -786,26 +788,24 @@ class AmneziaDiscoverer:
 
 
 class AmneziaApiSyncClient:
-    def __init__(self, base_url: str, password: str):
+    def __init__(self, base_url: str, password: str, username: str = "admin"):
         self.base_url = base_url.rstrip("/")
         self.password = password
+        self.username = username
         self.session = requests.Session()
+        self.session.auth = HTTPBasicAuth(username, password)
 
-    def login(self):
-        resp = self.session.post(
-            f"{self.base_url}/api/session",
-            json={"password": self.password, "remember": True},
-            headers={"Content-Type": "application/json"},
-        )
+    def login(self) -> None:
+        resp = self.session.get(f"{self.base_url}/api/client")
         resp.raise_for_status()
-
-    def get_clients(self):
+        logger.debug("✅ Успешная аутентификация в AmneziaWG Easy")
+    
+    def get_clients(self) -> List[Dict]:
         resp = self.session.get(
-            f"{self.base_url}/api/wireguard/client",
-            headers={"Accept": "application/json"},
+            f"{self.base_url}/api/client",
         )
         resp.raise_for_status()
-        return resp.json()
+        clients = resp.json()
 
 
 def _fetch_wg_api_data():
