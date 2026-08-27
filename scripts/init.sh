@@ -379,7 +379,7 @@ autorestart=true
 stdout_logfile=$LOGS_DIR/wg_stats.stdout.log
 stderr_logfile=$LOGS_DIR/wg_stats.stderr.log
 stdout_logfile_maxbytes=10MB
-stderr_logfile_maxups=10MB
+stderr_logfile_maxbytes=10MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
 EOF
