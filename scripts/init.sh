@@ -34,11 +34,11 @@ WORKER_COUNT=${WORKER_COUNT:-"2"}
 # Определение IP-адреса сервера
 # ==========================================
 get_server_ip() {
-    local ip=$(curl -s http://checkip.amazonaws.com 2>/dev/null || echo "")
-    if [[ -z "$ip" ]]; then
-        ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "127.0.0.1")
-    fi
-    echo "$ip"
+local ip=$(curl -s http://checkip.amazonaws.com 2>/dev/null || echo "")
+if [[ -z "$ip" ]]; then
+ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "127.0.0.1")
+fi
+echo "$ip"
 }
 SERVER_IP=$(get_server_ip)
 echo -e "${GREEN}Server IP detected: $SERVER_IP${RESET}"
@@ -46,266 +46,266 @@ echo -e "${GREEN}Server IP detected: $SERVER_IP${RESET}"
 # Функции HTTPS
 # ==========================================
 save_setup_var() {
-    local key=$1
-    local value=$2
-    if [[ -f "$ENV_FILE" ]]; then
-        if grep -q "^${key}=" "$ENV_FILE"; then
-            sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-        else
-            echo "${key}=${value}" >> "$ENV_FILE"
-        fi
-    fi
-    export "$key"="$value"
+local key=$1
+local value=$2
+if [[ -f "$ENV_FILE" ]]; then
+if grep -q "^${key}=" "$ENV_FILE"; then
+sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+else
+echo "${key}=${value}" >> "$ENV_FILE"
+fi
+fi
+export "$key"="$value"
 }
 # Функция обновления привязки Gunicorn
 update_service_ip() {
-    local new_ip=$1
-    local flask_port=$2
-    # 🔥 При HTTPS используем DEFAULT_PORT для Gunicorn
-    if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
-        flask_port=$DEFAULT_PORT
-    fi
-    if [[ -f "$SERVICE_FILE" ]]; then
-        sed -i "s|command=gunicorn -w $WORKER_COUNT main:app -b .*:[0-9]*|command=gunicorn -w $WORKER_COUNT main:app -b $new_ip:$flask_port|" "$SERVICE_FILE"
-        echo -e "${GREEN}Привязка сервиса обновлена $new_ip:$flask_port${RESET}"
-    fi
+local new_ip=$1
+local flask_port=$2
+# 🔥 При HTTPS используем DEFAULT_PORT для Gunicorn
+if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
+flask_port=$DEFAULT_PORT
+fi
+if [[ -f "$SERVICE_FILE" ]]; then
+sed -i "s|command=gunicorn -w $WORKER_COUNT main:app -b .*:[0-9]*|command=gunicorn -w $WORKER_COUNT main:app -b $new_ip:$flask_port|" "$SERVICE_FILE"
+echo -e "${GREEN}Привязка сервиса обновлена $new_ip:$flask_port${RESET}"
+fi
 }
 generate_self_signed_cert() {
-    local cert_domain=$1
-    local cert_ip=$2
-    local cert_path="$HTTPS_SELF_DIR/selfsigned.crt"
-    local key_path="$HTTPS_SELF_DIR/selfsigned.key"
-    echo -e "${YELLOW}🔒 Генерируем самоподписанный сертификат...${RESET}"
-    mkdir -p "$HTTPS_SELF_DIR"
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$key_path" \
-        -out "$cert_path" \
-        -subj "/C=US/ST=State/L=City/O=Organization/CN=$cert_domain" \
-        -addext "subjectAltName=DNS:$cert_domain,DNS:localhost,IP:$cert_ip"
-    chmod 600 "$key_path"
-    chmod 644 "$cert_path"
-    echo -e "${GREEN}Самоподписанный сертификат создан в $cert_path${RESET}"
-    echo -e "${YELLOW}Сертификат включает IP-адрес: $cert_ip${RESET}"
-    CERT_PATH="$cert_path"
-    KEY_PATH="$key_path"
-    CERT_TYPE="self-signed"
+local cert_domain=$1
+local cert_ip=$2
+local cert_path="$HTTPS_SELF_DIR/selfsigned.crt"
+local key_path="$HTTPS_SELF_DIR/selfsigned.key"
+echo -e "${YELLOW}🔒 Генерируем самоподписанный сертификат...${RESET}"
+mkdir -p "$HTTPS_SELF_DIR"
+openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+-keyout "$key_path" \
+-out "$cert_path" \
+-subj "/C=US/ST=State/L=City/O=Organization/CN=$cert_domain" \
+-addext "subjectAltName=DNS:$cert_domain,DNS:localhost,IP:$cert_ip"
+chmod 600 "$key_path"
+chmod 644 "$cert_path"
+echo -e "${GREEN}Самоподписанный сертификат создан в $cert_path${RESET}"
+echo -e "${YELLOW}Сертификат включает IP-адрес: $cert_ip${RESET}"
+CERT_PATH="$cert_path"
+KEY_PATH="$key_path"
+CERT_TYPE="self-signed"
 }
 copy_letsencrypt_cert() {
-    local domain=$1
-    local cert_path="$HTTPS_LE_DIR/${domain}_fullchain.pem"
-    local key_path="$HTTPS_LE_DIR/${domain}_privkey.pem"
-    echo -e "${YELLOW}📋 Копируем сертификаты Let's Encrypt...${RESET}"
-    mkdir -p "$HTTPS_LE_DIR"
-    cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_path"
-    cp "/etc/letsencrypt/live/$domain/privkey.pem" "$key_path"
-    chmod 644 "$cert_path"
-    chmod 600 "$key_path"
-    echo -e "${GREEN}Сертификат скопирован в $HTTPS_LE_DIR${RESET}"
-    CERT_PATH="$cert_path"
-    KEY_PATH="$key_path"
-    CERT_TYPE="letsencrypt"
+local domain=$1
+local cert_path="$HTTPS_LE_DIR/${domain}_fullchain.pem"
+local key_path="$HTTPS_LE_DIR/${domain}_privkey.pem"
+echo -e "${YELLOW}📋 Копируем сертификаты Let's Encrypt...${RESET}"
+mkdir -p "$HTTPS_LE_DIR"
+cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_path"
+cp "/etc/letsencrypt/live/$domain/privkey.pem" "$key_path"
+chmod 644 "$cert_path"
+chmod 600 "$key_path"
+echo -e "${GREEN}Сертификат скопирован в $HTTPS_LE_DIR${RESET}"
+CERT_PATH="$cert_path"
+KEY_PATH="$key_path"
+CERT_TYPE="letsencrypt"
 }
 # ✅ ЕДИНАЯ ФУНКЦИЯ: Проверка срока действия сертификата
 # Возвращает: 0 = валиден, 1 = ошибка/не существует, 2 = истёк или скоро истечёт
 check_cert_expiry() {
-    local cert_path=$1
-    local min_days=${2:-30}
-    if [[ ! -f "$cert_path" ]]; then
-        return 1
-    fi
-    local expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
-    if [[ -z "$expiry" ]]; then
-        return 1
-    fi
-    local expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
-    local now=$(date +%s)
-    local days_left=$(( (expiry_epoch - now) / 86400 ))
-    if [[ $days_left -lt 0 ]]; then
-        echo -e "${RED}⚠️  Сертификат истёк ${days_left#-} дней назад${RESET}"
-        return 2
-    elif [[ $days_left -lt $min_days ]]; then
-        echo -e "${YELLOW}⚠️  Сертификат истекает через $days_left дней (менее $min_days)${RESET}"
-        return 2
-    else
-        echo -e "${GREEN}✅ Сертификат действителен ещё $days_left дней${RESET}"
-        return 0
-    fi
+local cert_path=$1
+local min_days=${2:-30}
+if [[ ! -f "$cert_path" ]]; then
+return 1
+fi
+local expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+if [[ -z "$expiry" ]]; then
+return 1
+fi
+local expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
+local now=$(date +%s)
+local days_left=$(( (expiry_epoch - now) / 86400 ))
+if [[ $days_left -lt 0 ]]; then
+echo -e "${RED}⚠️  Сертификат истёк ${days_left#-} дней назад${RESET}"
+return 2
+elif [[ $days_left -lt $min_days ]]; then
+echo -e "${YELLOW}⚠️  Сертификат истекает через $days_left дней (менее $min_days)${RESET}"
+return 2
+else
+echo -e "${GREEN}✅ Сертификат действителен ещё $days_left дней${RESET}"
+return 0
+fi
 }
 # ✅ Проверка существующего сертификата (файлы + срок действия)
 validate_existing_cert() {
-    local domain=$1
-    local le_cert_path="$HTTPS_LE_DIR/${domain}_fullchain.pem"
-    local le_key_path="$HTTPS_LE_DIR/${domain}_privkey.pem"
-    # Проверяем наличие файлов в $HTTPS_LE_DIR
-    if [[ ! -f "$le_cert_path" ]] || [[ ! -f "$le_key_path" ]]; then
-        echo -e "${YELLOW}ℹ️  Файлы сертификата не найдены в $HTTPS_LE_DIR${RESET}"
-        return 1
-    fi
-    # ✅ Используем единую функцию check_cert_expiry для проверки срока
-    if check_cert_expiry "$le_cert_path" 30; then
-        echo -e "${GREEN}✅ Существующий сертификат валиден и будет использован${RESET}"
-        return 0
-    else
-        echo -e "${YELLOW}⚠️  Требуется обновление сертификата${RESET}"
-        return 1
-    fi
+local domain=$1
+local le_cert_path="$HTTPS_LE_DIR/${domain}_fullchain.pem"
+local le_key_path="$HTTPS_LE_DIR/${domain}_privkey.pem"
+# Проверяем наличие файлов в $HTTPS_LE_DIR
+if [[ ! -f "$le_cert_path" ]] || [[ ! -f "$le_key_path" ]]; then
+echo -e "${YELLOW}ℹ️  Файлы сертификата не найдены в $HTTPS_LE_DIR${RESET}"
+return 1
+fi
+# ✅ Используем единую функцию check_cert_expiry для проверки срока
+if check_cert_expiry "$le_cert_path" 30; then
+echo -e "${GREEN}✅ Существующий сертификат валиден и будет использован${RESET}"
+return 0
+else
+echo -e "${YELLOW}⚠️  Требуется обновление сертификата${RESET}"
+return 1
+fi
 }
 check_nginx_configs() {
-    local sites_available="/etc/nginx/sites-available"
-    local target_domain=$1
-    STATUSOPENVPN_CONFIGS=()
-    OTHER_CONFIGS=()
-    DOMAIN_CONFIG=""
-    for config_file in "$sites_available"/*; do
-        [[ ! -f "$config_file" ]] && continue
-        local basename_config=$(basename "$config_file")
-        [[ "$basename_config" == "default" ]] && continue
-        local first_line=$(head -n 1 "$config_file" 2>/dev/null)
-        if [[ "$first_line" == "# Created by StatusOpenVPN" ]]; then
-            STATUSOPENVPN_CONFIGS+=("$config_file")
-            if [[ "$basename_config" == "$target_domain" ]]; then
-                DOMAIN_CONFIG="$config_file"
-            fi
-        else
-            OTHER_CONFIGS+=("$config_file")
-        fi
-    done
+local sites_available="/etc/nginx/sites-available"
+local target_domain=$1
+STATUSOPENVPN_CONFIGS=()
+OTHER_CONFIGS=()
+DOMAIN_CONFIG=""
+for config_file in "$sites_available"/*; do
+[[ ! -f "$config_file" ]] && continue
+local basename_config=$(basename "$config_file")
+[[ "$basename_config" == "default" ]] && continue
+local first_line=$(head -n 1 "$config_file" 2>/dev/null)
+if [[ "$first_line" == "# Created by StatusOpenVPN" ]]; then
+STATUSOPENVPN_CONFIGS+=("$config_file")
+if [[ "$basename_config" == "$target_domain" ]]; then
+DOMAIN_CONFIG="$config_file"
+fi
+else
+OTHER_CONFIGS+=("$config_file")
+fi
+done
 }
 check_dependencies() {
-    local missing=()
-    if ! command -v nginx &> /dev/null; then
-        missing+=("nginx")
-    fi
-    if ! command -v openssl &> /dev/null; then
-        missing+=("openssl")
-    fi
-    if ! command -v certbot &> /dev/null; then
-        echo -e "${YELLOW}⚠️  certbot не найден. Сертификаты Let's Encrypt будут недоступны.${RESET}"
-    fi
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo -e "${RED}❌ Отсутствуют необходимые приложения: ${missing[*]}${RESET}"
-        echo -e "${YELLOW}Переключаемся на самоподписанный сертификат...${RESET}"
-        return 1
-    fi
-    return 0
+local missing=()
+if ! command -v nginx &> /dev/null; then
+missing+=("nginx")
+fi
+if ! command -v openssl &> /dev/null; then
+missing+=("openssl")
+fi
+if ! command -v certbot &> /dev/null; then
+echo -e "${YELLOW}⚠️  certbot не найден. Сертификаты Let's Encrypt будут недоступны.${RESET}"
+fi
+if [[ ${#missing[@]} -gt 0 ]]; then
+echo -e "${RED}❌ Отсутствуют необходимые приложения: ${missing[*]}${RESET}"
+echo -e "${YELLOW}Переключаемся на самоподписанный сертификат...${RESET}"
+return 1
+fi
+return 0
 }
 setup_https() {
-    local domain=$1
-    local use_self_signed=$2
-    local flask_port=$3
-    local https_port=$4
-    local server_ip=$5
-    echo -e "${YELLOW}🔧 Настраиваем HTTPS для $domain (Port: $https_port)...${RESET}"
-    mkdir -p "$HTTPS_DIR"
-    if ! check_dependencies; then
-        use_self_signed="true"
-        domain="$server_ip"
-    fi
-    if [[ "$use_self_signed" != "true" && ! "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if command -v curl &> /dev/null; then
-            DOMAIN_IP=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -n1 || echo "")
-            if [[ -n "$DOMAIN_IP" && "$server_ip" != "$DOMAIN_IP" ]]; then
-                echo -e "${RED}⚠️  Предупреждение: IP-адрес домена ($DOMAIN_IP) не совпадает с IP-адресом сервера ($server_ip).${RESET}"
-                echo -e "${YELLOW}Переключаемся на самоподписанный сертификат...${RESET}"
-                use_self_signed="true"
-                domain="$server_ip"
-            fi
-        fi
-    fi
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    if [[ "$use_self_signed" == "true" ]]; then
-        generate_self_signed_cert "$domain" "$server_ip"
-    else
-        # Проверяем сертификат в $HTTPS_LE_DIR перед запросом нового
-        if validate_existing_cert "$domain"; then
-            echo -e "${GREEN}📋 Используем существующий валидный сертификат из $HTTPS_LE_DIR${RESET}"
-            CERT_PATH="$HTTPS_LE_DIR/${domain}_fullchain.pem"
-            KEY_PATH="$HTTPS_LE_DIR/${domain}_privkey.pem"
-            CERT_TYPE="letsencrypt"
-        else
-            echo -e "${YELLOW}🔒 Получение нового сертификата от Let's Encrypt...${RESET}"
-            EMAIL="admin@$domain"
-            certbot --nginx -d "$domain" --email "$EMAIL" --agree-tos --non-interactive || {
-                echo -e "${RED}Certbot завершился ошибкой. Переключаемся на самоподписанный сертификат...${RESET}"
-                use_self_signed="true"
-                domain="$server_ip"
-                generate_self_signed_cert "$domain" "$server_ip"
-            }
-            if [[ "$use_self_signed" != "true" ]]; then
-                copy_letsencrypt_cert "$domain"
-            fi
-        fi
-    fi
-    check_nginx_configs "$domain"
-    local update_existing=false
-    local disable_default=false
-    if [[ -n "$DOMAIN_CONFIG" && ${#STATUSOPENVPN_CONFIGS[@]} -eq 1 && ${#OTHER_CONFIGS[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Обнаружен конфигурационный файл StatusOpenVPN. Обновляем...${RESET}"
-        update_existing=true
-        disable_default=true
-    elif [[ ${#STATUSOPENVPN_CONFIGS[@]} -eq 0 && ${#OTHER_CONFIGS[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Отсутствует конфигурация. Создаем новую...${RESET}"
-        disable_default=true
-    fi
-    local NGINX_CONF="/etc/nginx/sites-available/$domain"
-    local NGINX_LINK="/etc/nginx/sites-enabled/$domain"
-    local config_content
-    config_content=$(cat <<EOF
+local domain=$1
+local use_self_signed=$2
+local flask_port=$3
+local https_port=$4
+local server_ip=$5
+echo -e "${YELLOW}🔧 Настраиваем HTTPS для $domain (Port: $https_port)...${RESET}"
+mkdir -p "$HTTPS_DIR"
+if ! check_dependencies; then
+use_self_signed="true"
+domain="$server_ip"
+fi
+if [[ "$use_self_signed" != "true" && ! "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if command -v curl &> /dev/null; then
+DOMAIN_IP=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -n1 || echo "")
+if [[ -n "$DOMAIN_IP" && "$server_ip" != "$DOMAIN_IP" ]]; then
+echo -e "${RED}⚠️  Предупреждение: IP-адрес домена ($DOMAIN_IP) не совпадает с IP-адресом сервера ($server_ip).${RESET}"
+echo -e "${YELLOW}Переключаемся на самоподписанный сертификат...${RESET}"
+use_self_signed="true"
+domain="$server_ip"
+fi
+fi
+fi
+mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+if [[ "$use_self_signed" == "true" ]]; then
+generate_self_signed_cert "$domain" "$server_ip"
+else
+# Проверяем сертификат в $HTTPS_LE_DIR перед запросом нового
+if validate_existing_cert "$domain"; then
+echo -e "${GREEN}📋 Используем существующий валидный сертификат из $HTTPS_LE_DIR${RESET}"
+CERT_PATH="$HTTPS_LE_DIR/${domain}_fullchain.pem"
+KEY_PATH="$HTTPS_LE_DIR/${domain}_privkey.pem"
+CERT_TYPE="letsencrypt"
+else
+echo -e "${YELLOW}🔒 Получение нового сертификата от Let's Encrypt...${RESET}"
+EMAIL="admin@$domain"
+certbot --nginx -d "$domain" --email "$EMAIL" --agree-tos --non-interactive || {
+echo -e "${RED}Certbot завершился ошибкой. Переключаемся на самоподписанный сертификат...${RESET}"
+use_self_signed="true"
+domain="$server_ip"
+generate_self_signed_cert "$domain" "$server_ip"
+}
+if [[ "$use_self_signed" != "true" ]]; then
+copy_letsencrypt_cert "$domain"
+fi
+fi
+fi
+check_nginx_configs "$domain"
+local update_existing=false
+local disable_default=false
+if [[ -n "$DOMAIN_CONFIG" && ${#STATUSOPENVPN_CONFIGS[@]} -eq 1 && ${#OTHER_CONFIGS[@]} -eq 0 ]]; then
+echo -e "${YELLOW}Обнаружен конфигурационный файл StatusOpenVPN. Обновляем...${RESET}"
+update_existing=true
+disable_default=true
+elif [[ ${#STATUSOPENVPN_CONFIGS[@]} -eq 0 && ${#OTHER_CONFIGS[@]} -eq 0 ]]; then
+echo -e "${YELLOW}Отсутствует конфигурация. Создаем новую...${RESET}"
+disable_default=true
+fi
+local NGINX_CONF="/etc/nginx/sites-available/$domain"
+local NGINX_LINK="/etc/nginx/sites-enabled/$domain"
+local config_content
+config_content=$(cat <<EOF
 # Created by StatusOpenVPN
 server {
-    listen $https_port ssl;
-    server_name $domain;
-    ssl_certificate     $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    location / {
-        proxy_pass http://127.0.0.1:$DEFAULT_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Script-Name /;
-        proxy_redirect off;
-    }
+listen $https_port ssl;
+server_name $domain;
+ssl_certificate     $CERT_PATH;
+ssl_certificate_key $KEY_PATH;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers HIGH:!aNULL:!MD5;
+location / {
+proxy_pass http://127.0.0.1:$DEFAULT_PORT;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto https;
+proxy_set_header X-Script-Name /;
+proxy_redirect off;
+}
 }
 EOF
-    )
-    if [[ "$update_existing" == true ]]; then
-        echo "$config_content" > "$DOMAIN_CONFIG"
-        NGINX_CONF="$DOMAIN_CONFIG"
-    else
-        echo "$config_content" > "$NGINX_CONF"
-    fi
-    ln -sf "$NGINX_CONF" "$NGINX_LINK"
-    if [[ "$disable_default" == true ]]; then
-        local default_link="/etc/nginx/sites-enabled/default"
-        if [[ -L "$default_link" ]]; then
-            rm -f "$default_link"
-            echo -e "${GREEN}Default сайт отключен.${RESET}"
-        fi
-    fi
-    if nginx -t; then
-        echo -e "${GREEN}Тестирование конфигурации Nginx завершено успешно.${RESET}"
-    else
-        echo -e "${RED}Тестирование конфигурации Nginx завершилось ошибкой!${RESET}"
-        exit 1
-    fi
-    save_setup_var "HTTPS_ENABLED" "1"
-    save_setup_var "DOMAIN" "$domain"
-    save_setup_var "HTTPS_DIR" "$HTTPS_DIR"
-    save_setup_var "HTTPS_PORT" "$https_port"
-    save_setup_var "SERVER_IP" "$server_ip"
-    save_setup_var "CERT_TYPE" "$CERT_TYPE"
-    if [[ "$use_self_signed" == "true" ]]; then
-        save_setup_var "SELF_SIGNED" "1"
-    fi
-    echo -e "${GREEN}✅ Настройка HTTPS завершена. Приложение доступно по адресу: https://$domain:$https_port/${RESET}"
-    echo -e "${GREEN}Тип сертификата: $CERT_TYPE${RESET}"
-    echo -e "${GREEN}Путь к сертификату: $CERT_PATH${RESET}"
-    if [[ "$use_self_signed" == "true" ]]; then
-        echo -e "${YELLOW}⚠️  Заметка: Самоподписанный сертификат — примите предупреждение браузера.${RESET}"
-    fi
+)
+if [[ "$update_existing" == true ]]; then
+echo "$config_content" > "$DOMAIN_CONFIG"
+NGINX_CONF="$DOMAIN_CONFIG"
+else
+echo "$config_content" > "$NGINX_CONF"
+fi
+ln -sf "$NGINX_CONF" "$NGINX_LINK"
+if [[ "$disable_default" == true ]]; then
+local default_link="/etc/nginx/sites-enabled/default"
+if [[ -L "$default_link" ]]; then
+rm -f "$default_link"
+echo -e "${GREEN}Default сайт отключен.${RESET}"
+fi
+fi
+if nginx -t; then
+echo -e "${GREEN}Тестирование конфигурации Nginx завершено успешно.${RESET}"
+else
+echo -e "${RED}Тестирование конфигурации Nginx завершилось ошибкой!${RESET}"
+exit 1
+fi
+save_setup_var "HTTPS_ENABLED" "1"
+save_setup_var "DOMAIN" "$domain"
+save_setup_var "HTTPS_DIR" "$HTTPS_DIR"
+save_setup_var "HTTPS_PORT" "$https_port"
+save_setup_var "SERVER_IP" "$server_ip"
+save_setup_var "CERT_TYPE" "$CERT_TYPE"
+if [[ "$use_self_signed" == "true" ]]; then
+save_setup_var "SELF_SIGNED" "1"
+fi
+echo -e "${GREEN}✅ Настройка HTTPS завершена. Приложение доступно по адресу: https://$domain:$https_port/${RESET}"
+echo -e "${GREEN}Тип сертификата: $CERT_TYPE${RESET}"
+echo -e "${GREEN}Путь к сертификату: $CERT_PATH${RESET}"
+if [[ "$use_self_signed" == "true" ]]; then
+echo -e "${YELLOW}⚠️  Заметка: Самоподписанный сертификат — примите предупреждение браузера.${RESET}"
+fi
 }
 # ==========================================
 # Основная логика инициализации
@@ -317,22 +317,22 @@ mkdir -p "$LOGS_DIR"
 mkdir -p "$NEW_DATABASE_DIR"
 # Создаем HTTPS директорию если нужно
 if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
-    mkdir -p "$HTTPS_DIR"
-    echo -e "${GREEN}HTTPS папка создана: $HTTPS_DIR${RESET}"
+mkdir -p "$HTTPS_DIR"
+echo -e "${GREEN}HTTPS папка создана: $HTTPS_DIR${RESET}"
 fi
 # ==========================================
 # Создание supervisord.conf
 # ==========================================
 if [ ! -f "$SERVICE_FILE" ]; then
-    # 🔥 Определяем порт для Gunicorn
-    if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
-        GUNICORN_PORT=$DEFAULT_PORT  # Внутренний порт для Gunicorn
-        GUNICORN_BIND="127.0.0.1:$GUNICORN_PORT"
-    else
-        GUNICORN_PORT=$PORT  # Внешний порт (без HTTPS)
-        GUNICORN_BIND="0.0.0.0:$GUNICORN_PORT"
-    fi
-    cat <<EOF | tee $SERVICE_FILE
+# 🔥 Определяем порт для Gunicorn
+if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
+GUNICORN_PORT=$DEFAULT_PORT  # Внутренний порт для Gunicorn
+GUNICORN_BIND="127.0.0.1:$GUNICORN_PORT"
+else
+GUNICORN_PORT=$PORT  # Внешний порт (без HTTPS)
+GUNICORN_BIND="0.0.0.0:$GUNICORN_PORT"
+fi
+cat <<EOF | tee $SERVICE_FILE
 [supervisord]
 user=root
 nodaemon=true
@@ -379,21 +379,21 @@ autorestart=true
 stdout_logfile=$LOGS_DIR/wg_stats.stdout.log
 stderr_logfile=$LOGS_DIR/wg_stats.stderr.log
 stdout_logfile_maxbytes=10MB
-stderr_logfile_maxbytes=10MB
+stderr_logfile_maxups=10MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
 EOF
-    echo -e "${GREEN}Базовая настройка Supervisord завершена.${RESET}"
+echo -e "${GREEN}Базовая настройка Supervisord завершена.${RESET}"
 else
-    echo "SERVICE_FILE существует, пропускаем создание файла."
+echo "SERVICE_FILE существует, пропускаем создание файла."
 fi
 # ==========================================
 # Добавление Nginx в Supervisor (если HTTPS)
 # ==========================================
 if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
-    echo -e "${YELLOW}🔐 HTTPS включен. Добавляем Nginx в Supervisor...${RESET}"
-    # Добавляем конфигурацию Nginx в supervisord.conf
-    cat <<EOF >> $SERVICE_FILE
+echo -e "${YELLOW}🔐 HTTPS включен. Добавляем Nginx в Supervisor...${RESET}"
+# Добавляем конфигурацию Nginx в supervisord.conf
+cat <<EOF >> $SERVICE_FILE
 [program:nginx]
 user=root
 command=nginx -g 'daemon off;'
@@ -406,13 +406,13 @@ stderr_logfile_maxbytes=10MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
 EOF
-    echo -e "${GREEN}Служба Nginx добавлена в Supervisor.${RESET}"
+echo -e "${GREEN}Служба Nginx добавлена в Supervisor.${RESET}"
 fi
 # ==========================================
 # Telegram Bot
 # ==========================================
 if [[ "$BOT_ON" =~ ^[Yy]$ ]]; then
-    cat <<EOF | tee -a $SERVICE_FILE >/dev/null
+cat <<EOF | tee -a $SERVICE_FILE >/dev/null
 [program:telegram-bot]
 command=/usr/local/bin/python $ROOT_DIR/src/vpn_bot.py
 directory=$ROOT_DIR/src
@@ -429,119 +429,171 @@ stderr_logfile_maxbytes=10MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
 EOF
-    if [ ! -f "$ENV_FILE" ]; then
-        echo "Creating .env file at $ENV_FILE..."
-        cat <<EOF > $ENV_FILE
+if [ ! -f "$ENV_FILE" ]; then
+echo "Creating .env file at $ENV_FILE..."
+cat <<EOF > $ENV_FILE
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_ID=$ADMIN_ID
 EOF
-    else
-        echo ".env файл существует. Пропускаем создание."
-    fi
-    echo -e "${GREEN}Telegram bot configured.${RESET}"
+else
+echo ".env файл существует. Пропускаем создание."
+fi
+echo -e "${GREEN}Telegram bot configured.${RESET}"
 fi
 # ==========================================
 # Настройка HTTPS
 # ==========================================
 if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
-    echo -e "${YELLOW}🔐 Настраиваем HTTPS...${RESET}"
-    USE_SELF_SIGNED="false"
-    # Определяем тип сертификата
-    if [[ -z "$DOMAIN_NAME" ]]; then
-        USE_SELF_SIGNED="true"
-        DOMAIN_NAME="$SERVER_IP"
-        echo -e "${YELLOW}Домен отсутствует. Используем самоподписанный сертификат для IP: $SERVER_IP${RESET}"
-    elif [[ "$DOMAIN_NAME" == "localhost" ]] || [[ "$DOMAIN_NAME" == "127.0.0.1" ]]; then
-        USE_SELF_SIGNED="true"
-        DOMAIN_NAME="$SERVER_IP"
-        echo -e "${YELLOW}Обнаружен Localhost. Используем самоподписанный сертификат для IP: $SERVER_IP${RESET}"
-    else
-        echo -e "${GREEN}Домен указан: $DOMAIN_NAME. Пробуем получить сертификат Let's Encrypt...${RESET}"
-    fi
-    setup_https "$DOMAIN_NAME" "$USE_SELF_SIGNED" "$PORT" "$PORT" "$SERVER_IP"
-    # Обновляем привязку Gunicorn на localhost (только Nginx может обращаться)
-    update_service_ip "127.0.0.1" "$DEFAULT_PORT"
-    # ==========================================
-    # Добавление мониторинга сертификатов (ТОЛЬКО если есть домен)
-    # ==========================================
-    # Проверяем, что это НЕ самоподписанный сертификат и домен не является IP
-    if [[ "$USE_SELF_SIGNED" != "true" ]] && [[ ! "$DOMAIN_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo -e "${YELLOW}🔒 Настраиваем службу автообновления сертификата...${RESET}"
-        # Создаем скрипт мониторинга
-        cat <<'MONITOR_SCRIPT' > $ROOT_DIR/scripts/cert_monitor.sh
+echo -e "${YELLOW}🔐 Настраиваем HTTPS...${RESET}"
+USE_SELF_SIGNED="false"
+# Определяем тип сертификата
+if [[ -z "$DOMAIN_NAME" ]]; then
+USE_SELF_SIGNED="true"
+DOMAIN_NAME="$SERVER_IP"
+echo -e "${YELLOW}Домен отсутствует. Используем самоподписанный сертификат для IP: $SERVER_IP${RESET}"
+elif [[ "$DOMAIN_NAME" == "localhost" ]] || [[ "$DOMAIN_NAME" == "127.0.0.1" ]]; then
+USE_SELF_SIGNED="true"
+DOMAIN_NAME="$SERVER_IP"
+echo -e "${YELLOW}Обнаружен Localhost. Используем самоподписанный сертификат для IP: $SERVER_IP${RESET}"
+else
+echo -e "${GREEN}Домен указан: $DOMAIN_NAME. Пробуем получить сертификат Let's Encrypt...${RESET}"
+fi
+setup_https "$DOMAIN_NAME" "$USE_SELF_SIGNED" "$PORT" "$PORT" "$SERVER_IP"
+# Обновляем привязку Gunicorn на localhost (только Nginx может обращаться)
+update_service_ip "127.0.0.1" "$DEFAULT_PORT"
+# ==========================================
+# Добавление мониторинга сертификатов (ТОЛЬКО если есть домен)
+# ==========================================
+# Проверяем, что это НЕ самоподписанный сертификат и домен не является IP
+if [[ "$USE_SELF_SIGNED" != "true" ]] && [[ ! "$DOMAIN_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+echo -e "${YELLOW}🔒 Настраиваем службу автообновления сертификата...${RESET}"
+# Создаем скрипт мониторинга
+cat <<'MONITOR_SCRIPT' > $ROOT_DIR/scripts/cert_monitor.sh
 #!/usr/bin/env bash
-set -e
+# Мониторинг и автообновление сертификата Let's Encrypt
+# Примечание: НЕ используем `set -e`, т.к. это долгоживущий демон
+
 ROOT_DIR="/root/web"
 ENV_FILE="$ROOT_DIR/src/data/.env"
 HTTPS_DIR="$ROOT_DIR/src/data/https"
 HTTPS_LE_DIR="$HTTPS_DIR/letsencrypt"
+LOGS_DIR="$ROOT_DIR/src/data/logs"
 LOG_FILE="$LOGS_DIR/cert_renew.log"
 RENEW_THRESHOLD=30
 CHECK_INTERVAL=86400
+
 log() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
     echo -e "$(date '+%d-%m-%Y %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
-# ✅ ЕДИНАЯ ФУНКЦИЯ ПРОВЕРКИ (как в основном скрипте)
+
+# Проверка срока действия сертификата
+# Возврат: 0 = валиден, 1 = ошибка/нет файла, 2 = истёк или истекает скоро
 check_cert_expiry() {
     local cert_path=$1
     local min_days=${2:-30}
     [[ ! -f "$cert_path" ]] && return 1
-    local expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+    local expiry
+    expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
     [[ -z "$expiry" ]] && return 1
-    local expiry_epoch=$(date -d "$expiry" +%s)
-    local now=$(date +%s)
-    local days=$(( (expiry_epoch - now) / 86400 ))
-    log "ℹ️ Сертификат истекает через $days дней"
-    [[ $days -lt 0 ]] && return 2
-    [[ $days -lt $min_days ]] && return 2
-    return 0
+    local expiry_epoch now days
+    expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null) || return 1
+    now=$(date +%s)
+    days=$(( (expiry_epoch - now) / 86400 ))
+    if [[ $days -lt 0 ]]; then
+        log "ℹ️ Сертификат истёк $(( -days )) дней назад"
+        return 2
+    elif [[ $days -lt $min_days ]]; then
+        log "ℹ️ Сертификат истекает через $days дней (порог: $min_days)"
+        return 2
+    else
+        log "ℹ️ Сертификат действителен ещё $days дней"
+        return 0
+    fi
 }
+
 renew_cert() {
     local domain=$1
     log "🔄 Обновляем сертификат для домена $domain..."
-    certbot renew --non-interactive --quiet 2>/dev/null || return 1
-    log "✅ Сертификат обновлен"
+    # Ошибки пишем в лог, чтобы видеть причину сбоя
+    if certbot renew --non-interactive --quiet >> "$LOG_FILE" 2>&1; then
+        log "✅ certbot: команда обновления выполнена успешно"
+        return 0
+    else
+        log "❌ certbot завершился с ошибкой (детали в $LOG_FILE)"
+        return 1
+    fi
 }
+
 copy_certs() {
     local domain=$1
     local src_cert="/etc/letsencrypt/live/$domain/fullchain.pem"
     local src_key="/etc/letsencrypt/live/$domain/privkey.pem"
     local dst_dir="$HTTPS_LE_DIR"
-    [[ ! -f "$src_cert" ]] || [[ ! -f "$src_key" ]] && return 1
+    if [[ ! -f "$src_cert" ]] || [[ ! -f "$src_key" ]]; then
+        log "❌ Исходные сертификаты не найдены в /etc/letsencrypt/live/$domain/"
+        return 1
+    fi
     mkdir -p "$dst_dir"
     cp "$src_cert" "$dst_dir/${domain}_fullchain.pem"
     cp "$src_key" "$dst_dir/${domain}_privkey.pem"
     chmod 644 "$dst_dir/${domain}_fullchain.pem"
     chmod 600 "$dst_dir/${domain}_privkey.pem"
-    log "✅ Сертификат скопирован"
+    log "✅ Сертификат скопирован в $dst_dir"
 }
+
 reload_nginx() {
-    nginx -t 2>/dev/null || return 1
-    supervisorctl restart nginx 2>/dev/null || systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null || return 1
-    log "✅ Nginx перезапущен"
+    if ! nginx -t 2>>"$LOG_FILE"; then
+        log "❌ nginx -t: ошибка конфигурации"
+        return 1
+    fi
+    if supervisorctl restart nginx >>"$LOG_FILE" 2>&1; then
+        log "✅ Nginx перезапущен через supervisorctl"
+    elif systemctl reload nginx >>"$LOG_FILE" 2>&1; then
+        log "✅ Nginx перезапущен через systemctl"
+    elif service nginx reload >>"$LOG_FILE" 2>&1; then
+        log "✅ Nginx перезапущен через service"
+    else
+        log "❌ Не удалось перезапустить Nginx"
+        return 1
+    fi
 }
-# Main Loop
+
+# Основной цикл
 [[ ! -f "$ENV_FILE" ]] && { log "❌ .env не найден"; exit 1; }
 DOMAIN=$(grep "^DOMAIN=" "$ENV_FILE" 2>/dev/null | cut -d= -f2)
 [[ -z "$DOMAIN" ]] && { log "❌ Домен не настроен"; exit 1; }
 log "🔒 Монитор сертификата для $DOMAIN запущен"
+
 while true; do
-    # ✅ ПРОВЕРЯЕМ СЕРТИФИКАТ В $HTTPS_LE_DIR
     cert_file="$HTTPS_LE_DIR/${DOMAIN}_fullchain.pem"
-    if ! check_cert_expiry "$cert_file" $RENEW_THRESHOLD; then
-        status=$?
-        if [[ $status -eq 2 ]]; then
+
+    # FIX: корректно сохраняем код возврата (без инверсии в if)
+    status=0
+    check_cert_expiry "$cert_file" "$RENEW_THRESHOLD" || status=$?
+
+    case $status in
+        0)
+            log "✅ Сертификат действующий"
+            ;;
+        2)
             log "⚠️ Требуется обновление сертификата"
-            renew_cert "$DOMAIN" && copy_certs "$DOMAIN" && reload_nginx || log "❌ Обновление завершено с ошибкой"
-        fi
-    else
-        log "✅ Сертификат действующий"
-    fi
-    sleep $CHECK_INTERVAL
+            if renew_cert "$DOMAIN" && copy_certs "$DOMAIN" && reload_nginx; then
+                log "✅ Обновление сертификата завершено успешно"
+            else
+                log "❌ Обновление завершено с ошибкой"
+            fi
+            ;;
+        *)
+            log "❌ Ошибка проверки сертификата (код: $status). Файл: $cert_file"
+            ;;
+    esac
+
+    sleep "$CHECK_INTERVAL"
 done
 MONITOR_SCRIPT
-        chmod +x $ROOT_DIR/scripts/cert_monitor.sh
-        cat <<EOF >> $SERVICE_FILE
+chmod +x $ROOT_DIR/scripts/cert_monitor.sh
+cat <<EOF >> $SERVICE_FILE
 [program:cert-monitor]
 command=$ROOT_DIR/scripts/cert_monitor.sh
 directory=$ROOT_DIR/scripts
@@ -556,13 +608,13 @@ stderr_logfile_maxbytes=10MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
 EOF
-        echo -e "${GREEN}Мониторинг сертификата добавлен в Supervisor${RESET}"
-    else
-        echo -e "${YELLOW}ℹ️  Самоподписанный сертификат не нуждается в обновлении${RESET}"
-    fi
+echo -e "${GREEN}Мониторинг сертификата добавлен в Supervisor${RESET}"
 else
-    update_service_ip "0.0.0.0" "$PORT"
-    save_setup_var "HTTPS_ENABLED" "0"
+echo -e "${YELLOW}ℹ️  Самоподписанный сертификат не нуждается в обновлении${RESET}"
+fi
+else
+update_service_ip "0.0.0.0" "$PORT"
+save_setup_var "HTTPS_ENABLED" "0"
 fi
 # ==========================================
 # Настройка vnStat
@@ -570,83 +622,83 @@ fi
 echo -e "${YELLOW}📊 Настройка vnStat...${RESET}"
 sed -i 's/^USER=vnstat/USER=root/' /etc/init.d/vnstat
 if [ -f "$VNSTAT_CONF_FILE" ]; then
-    echo "Корректировка файла $VNSTAT_CONF_FILE..."
-    sed -i 's|^;\?UseLogging.*|UseLogging 1|' "$VNSTAT_CONF_FILE"
-    sed -i "s|^;\?LogFile.*|LogFile \"$ROOT_DIR/src/data/logs/vnstat.log\"|" "$VNSTAT_CONF_FILE"
-    sed -i 's|^;\?DatabaseDir.*|DatabaseDir "'"$NEW_DATABASE_DIR"'"|' "$VNSTAT_CONF_FILE"
-    sed -i 's|^;\?AlwaysAddNewInterfaces.*|AlwaysAddNewInterfaces 0|' "$VNSTAT_CONF_FILE"
-    echo "Файл $VNSTAT_CONF_FILE успешно скорректирован."
+echo "Корректировка файла $VNSTAT_CONF_FILE..."
+sed -i 's|^;\?UseLogging.*|UseLogging 1|' "$VNSTAT_CONF_FILE"
+sed -i "s|^;\?LogFile.*|LogFile \"$ROOT_DIR/src/data/logs/vnstat.log\"|" "$VNSTAT_CONF_FILE"
+sed -i 's|^;\?DatabaseDir.*|DatabaseDir "'"$NEW_DATABASE_DIR"'"|' "$VNSTAT_CONF_FILE"
+sed -i 's|^;\?AlwaysAddNewInterfaces.*|AlwaysAddNewInterfaces 0|' "$VNSTAT_CONF_FILE"
+echo "Файл $VNSTAT_CONF_FILE успешно скорректирован."
 else
-    echo "Файл $VNSTAT_CONF_FILE не найден."
+echo "Файл $VNSTAT_CONF_FILE не найден."
 fi
 # Временно отключаем строгий режим для vnStat, чтобы ошибки не роняли скрипт
 set +e
 vnstatd --initdb 2>/dev/null || echo "vnstatd уже инициализирован"
 # Функция безопасного добавления интерфейса и алиаса в vnStat
 add_vnstat_iface() {
-    local iface="$1"
-    local alias_name="$2"
-    # Проверяем, есть ли интерфейс в БД
-    if ! vnstat --dbiflist 2>/dev/null | grep -qw "$iface"; then
-        echo -e "   ${GREEN}📡 Добавляю интерфейс $iface в vnStat...${RESET}"
-        if vnstat --add -i "$iface" 2>&1; then
-            echo -e "   ${GREEN}✅ Интерфейс $iface добавлен.${RESET}"
-        else
-            echo -e "   ${RED}❌ Ошибка добавления $iface. Проверьте права и состояние интерфейса.${RESET}"
-        fi
-    else
-        echo -e "   ${GREEN}ℹ️  Интерфейс $iface уже в vnStat.${RESET}"
-    fi
-    # Устанавливаем алиас
-    if [[ -n "$alias_name" ]]; then
-        echo -e "   ${GREEN}🏷️  Устанавливаю алиас '$alias_name' для $iface...${RESET}"
-        if vnstat -i "$iface" --setalias "$alias_name" 2>&1; then
-            echo -e "   ${GREEN}✅ Алиас установлен.${RESET}"
-        else
-            echo -e "   ${RED}❌ Ошибка установки алиаса (возможно, старая версия vnstat < 2.10).${RESET}"
-        fi
-    fi
+local iface="$1"
+local alias_name="$2"
+# Проверяем, есть ли интерфейс в БД
+if ! vnstat --dbiflist 2>/dev/null | grep -qw "$iface"; then
+echo -e "   ${GREEN}📡 Добавляю интерфейс $iface в vnStat...${RESET}"
+if vnstat --add -i "$iface" 2>&1; then
+echo -e "   ${GREEN}✅ Интерфейс $iface добавлен.${RESET}"
+else
+echo -e "   ${RED}❌ Ошибка добавления $iface. Проверьте права и состояние интерфейса.${RESET}"
+fi
+else
+echo -e "   ${GREEN}ℹ️  Интерфейс $iface уже в vnStat.${RESET}"
+fi
+# Устанавливаем алиас
+if [[ -n "$alias_name" ]]; then
+echo -e "   ${GREEN}🏷️  Устанавливаю алиас '$alias_name' для $iface...${RESET}"
+if vnstat -i "$iface" --setalias "$alias_name" 2>&1; then
+echo -e "   ${GREEN}✅ Алиас установлен.${RESET}"
+else
+echo -e "   ${RED}❌ Ошибка установки алиаса (возможно, старая версия vnstat < 2.10).${RESET}"
+fi
+fi
 }
 # 1. Добавляем физические интерфейсы (eth, ens)
 echo -e "${YELLOW}🔍 Поиск физических интерфейсов...${RESET}"
 for iface in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|ens)'); do
-    add_vnstat_iface "$iface" "Host"
+add_vnstat_iface "$iface" "Host"
 done
 # 2. Добавляем veth-интерфейсы контейнеров Amnezia/OpenVPN (УНИВЕРСАЛЬНАЯ ВЕРСИЯ)
 if command -v docker &> /dev/null; then
-    echo -e "${YELLOW}🐳 Сопоставление veth ↔ контейнеры Docker...${RESET}"
-    # Временно отключаем строгий режим, чтобы ошибки одного контейнера не останавливали весь скрипт
-    set +e
-    while IFS= read -r cname; do
-        [[ -z "$cname" ]] && continue
-        echo -e "   ${YELLOW}Обработка контейнера: $cname${RESET}"
-        # 🔥 Используем docker exec для получения информации о сети
-        # Это работает и на хосте, и внутри контейнера (при наличии сокета)
-        eth0_info=$(docker exec "$cname" ip -o link show eth0 2>&1)
-        if [[ $? -ne 0 ]] || [[ -z "$eth0_info" ]]; then
-            echo -e "   ${RED}⚠️  Не удалось получить данные сети (контейнер остановлен или нет прав).${RESET}"
-            continue
-        fi
-        # Извлекаем Peer IfIndex (индекс veth на хосте)
-        # Вывод ip: "2: eth0@if162: <..." -> Нам нужно 162
-        peer_idx=$(echo "$eth0_info" | awk -F'@if' '{print $2}' | cut -d: -f1 | tr -d '[:space:]')
-        if [[ -z "$peer_idx" ]] || [[ ! "$peer_idx" =~ ^[0-9]+$ ]]; then
-            echo -e "   ${RED}⚠️  Не найден интерфейс eth0 внутри контейнера.${RESET}"
-            continue
-        fi
-        # Ищем на хосте интерфейс с этим индексом
-        # Вывод ip на хосте: "162: veth7e6688e@if2: ..."
-        veth_name=$(ip -o link show 2>/dev/null | awk -v idx="$peer_idx" '$1 == idx ":" {print $2}' | cut -d: -f1 | cut -d@ -f1)
-        if [[ -n "$veth_name" ]]; then
-            add_vnstat_iface "$veth_name" "$cname"
-        else
-            echo -e "   ${RED}⚠️  Не найден veth-интерфейс с индексом $peer_idx.${RESET}"
-        fi
-    done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei '(amnezia|openvpn-1)')
-    # Возвращаем строгий режим
-    set -e
+echo -e "${YELLOW}🐳 Сопоставление veth ↔ контейнеры Docker...${RESET}"
+# Временно отключаем строгий режим, чтобы ошибки одного контейнера не останавливали весь скрипт
+set +e
+while IFS= read -r cname; do
+[[ -z "$cname" ]] && continue
+echo -e "   ${YELLOW}Обработка контейнера: $cname${RESET}"
+# 🔥 Используем docker exec для получения информации о сети
+# Это работает и на хосте, и внутри контейнера (при наличии сокета)
+eth0_info=$(docker exec "$cname" ip -o link show eth0 2>&1)
+if [[ $? -ne 0 ]] || [[ -z "$eth0_info" ]]; then
+echo -e "   ${RED}⚠️  Не удалось получить данные сети (контейнер остановлен или нет прав).${RESET}"
+continue
+fi
+# Извлекаем Peer IfIndex (индекс veth на хосте)
+# Вывод ip: "2: eth0@if162: <..." -> Нам нужно 162
+peer_idx=$(echo "$eth0_info" | awk -F'@if' '{print $2}' | cut -d: -f1 | tr -d '[:space:]')
+if [[ -z "$peer_idx" ]] || [[ ! "$peer_idx" =~ ^[0-9]+$ ]]; then
+echo -e "   ${RED}⚠️  Не найден интерфейс eth0 внутри контейнера.${RESET}"
+continue
+fi
+# Ищем на хосте интерфейс с этим индексом
+# Вывод ip на хосте: "162: veth7e6688e@if2: ..."
+veth_name=$(ip -o link show 2>/dev/null | awk -v idx="$peer_idx" '$1 == idx ":" {print $2}' | cut -d: -f1 | cut -d@ -f1)
+if [[ -n "$veth_name" ]]; then
+add_vnstat_iface "$veth_name" "$cname"
 else
-    echo -e "${YELLOW}⚠️  Docker не найден, пропускаем поиск veth-интерфейсов.${RESET}"
+echo -e "   ${RED}⚠️  Не найден veth-интерфейс с индексом $peer_idx.${RESET}"
+fi
+done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei '(amnezia|openvpn-1)')
+# Возвращаем строгий режим
+set -e
+else
+echo -e "${YELLOW}⚠️  Docker не найден, пропускаем поиск veth-интерфейсов.${RESET}"
 fi
 service vnstat start 2>/dev/null || echo "Служба vnstat уже запущена"
 set -e
@@ -655,64 +707,58 @@ set -e
 # ==========================================
 echo -e "${YELLOW}📊 Создаю скрипт мониторинга интерфейсов vnStat...${RESET}"
 mkdir -p "$ROOT_DIR/scripts"
-cat <<'MONITOR_SCRIPT' > "$ROOT_DIR/scripts/vnstat_monitor.sh"
+cat <<'VNSTAT_MONITOR_SCRIPT' > "$ROOT_DIR/scripts/vnstat_monitor.sh"
 #!/usr/bin/env bash
 set +e
 ROOT_DIR="/root/web"
 LOGS_DIR="$ROOT_DIR/src/data/logs"
 LOG_FILE="$LOGS_DIR/vnstat_monitor.log"
 CHECK_INTERVAL=10
-
 log() {
-    echo -e "$(date '+%d-%m-%Y %H:%M:%S') $1" | tee -a "$LOG_FILE"
+echo -e "$(date '+%d-%m-%Y %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
-
 add_if_missing() {
-    local iface="$1"
-    local alias_name="$2"
-    if ! vnstat --dbiflist 2>/dev/null | grep -qw "$iface"; then
-        log "📡 Добавляю интерфейс $iface в vnStat..."
-        if vnstat --add -i "$iface" 2>&1; then
-            log "✅ Интерфейс $iface добавлен."
-        else
-            log "❌ Ошибка добавления $iface."
-        fi
-        if [[ -n "$alias_name" ]]; then
-            log "🏷️  Устанавливаю алиас '$alias_name' для $iface..."
-            if vnstat -i "$iface" --setalias "$alias_name" 2>&1; then
-                log "✅ Алиас установлен."
-            else
-                log "⚠️  Ошибка установки алиаса."
-            fi
-        fi
-    fi
+local iface="$1"
+local alias_name="$2"
+if ! vnstat --dbiflist 2>/dev/null | grep -qw "$iface"; then
+log "📡 Добавляю интерфейс $iface в vnStat..."
+if vnstat --add -i "$iface" 2>&1; then
+log "✅ Интерфейс $iface добавлен."
+else
+log "❌ Ошибка добавления $iface."
+fi
+if [[ -n "$alias_name" ]]; then
+log "🏷️  Устанавливаю алиас '$alias_name' для $iface..."
+if vnstat -i "$iface" --setalias "$alias_name" 2>&1; then
+log "✅ Алиас установлен."
+else
+log "⚠️  Ошибка установки алиаса."
+fi
+fi
+fi
 }
-
 log "🔒 Мониторинг интерфейсов vnStat запущен (интервал: ${CHECK_INTERVAL}с)"
 while true; do
-    for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|ens)' 2>/dev/null); do
-        add_if_missing "$iface" "Host"
-    done
-
-    if command -v docker &> /dev/null; then
-        while IFS= read -r cname; do
-            [[ -z "$cname" ]] && continue
-            eth0_info=$(docker exec "$cname" ip -o link show eth0 2>&1) || { log "⚠️  Не удалось проверить контейнер $cname"; continue; }
-            peer_idx=$(echo "$eth0_info" | awk -F'@if' '{print $2}' | cut -d: -f1 | tr -d '[:space:]')
-            [[ -z "$peer_idx" ]] && continue
-            veth_name=$(ip -o link show 2>/dev/null | awk -v idx="$peer_idx" '$1 == idx ":" {print $2}' | cut -d: -f1 | cut -d@ -f1)
-            if [[ -n "$veth_name" ]]; then
-                add_if_missing "$veth_name" "$cname"
-            fi
-        done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei '(amnezia|openvpn-1)')
-    fi
-
-    sleep $CHECK_INTERVAL
+for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|ens)' 2>/dev/null); do
+add_if_missing "$iface" "Host"
 done
-MONITOR_SCRIPT
+if command -v docker &> /dev/null; then
+while IFS= read -r cname; do
+[[ -z "$cname" ]] && continue
+eth0_info=$(docker exec "$cname" ip -o link show eth0 2>&1) || { log "⚠️  Не удалось проверить контейнер $cname"; continue; }
+peer_idx=$(echo "$eth0_info" | awk -F'@if' '{print $2}' | cut -d: -f1 | tr -d '[:space:]')
+[[ -z "$peer_idx" ]] && continue
+veth_name=$(ip -o link show 2>/dev/null | awk -v idx="$peer_idx" '$1 == idx ":" {print $2}' | cut -d: -f1 | cut -d@ -f1)
+if [[ -n "$veth_name" ]]; then
+add_if_missing "$veth_name" "$cname"
+fi
+done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei '(amnezia|openvpn-1)')
+fi
+sleep $CHECK_INTERVAL
+done
+VNSTAT_MONITOR_SCRIPT
 chmod +x "$ROOT_DIR/scripts/vnstat_monitor.sh"
 echo -e "${GREEN}✅ Скрипт мониторинга интерфейсов создан.${RESET}"
-
 # Добавление в Supervisor
 cat <<EOF >> $SERVICE_FILE
 [program:vnstat-monitor]
@@ -737,16 +783,16 @@ echo -e "${GREEN}========================================${RESET}"
 echo -e "${GREEN}✅ Инициализация завершена!${RESET}"
 echo -e "${GREEN}========================================${RESET}"
 if [[ "$HTTPS_ON" =~ ^[Yy]$ ]]; then
-    echo -e "${GREEN}Веб-интерфейс: https://$DOMAIN_NAME:$PORT/${RESET}"
-    echo -e "${GREEN}Папка сертификата: $HTTPS_DIR${RESET}"
-    echo -e "${GREEN}Тип сертификата: $CERT_TYPE${RESET}"
-    echo -e "${GREEN}IP сервера: $SERVER_IP${RESET}"
-    echo -e "${GREEN}Gunicorn Binding: 127.0.0.1${RESET}"
-    if [[ -z "${DOMAIN_NAME}" ]] || [[ "$DOMAIN_NAME" == "$SERVER_IP" ]] || [[ "$CERT_TYPE" == "self-signed" ]]; then
-        echo -e "${YELLOW}⚠️  Самоподписанный сертификат — примите предупреждение браузера${RESET}"
-    fi
+echo -e "${GREEN}Веб-интерфейс: https://$DOMAIN_NAME:$PORT/${RESET}"
+echo -e "${GREEN}Папка сертификата: $HTTPS_DIR${RESET}"
+echo -e "${GREEN}Тип сертификата: $CERT_TYPE${RESET}"
+echo -e "${GREEN}IP сервера: $SERVER_IP${RESET}"
+echo -e "${GREEN}Gunicorn Binding: 127.0.0.1${RESET}"
+if [[ -z "${DOMAIN_NAME}" ]] || [[ "$DOMAIN_NAME" == "$SERVER_IP" ]] || [[ "$CERT_TYPE" == "self-signed" ]]; then
+echo -e "${YELLOW}⚠️  Самоподписанный сертификат — примите предупреждение браузера${RESET}"
+fi
 else
-    echo -e "${GREEN}Веб-интерфейс: http://$SERVER_IP:$PORT/${RESET}"
-    echo -e "${GREEN}Gunicorn Binding: 0.0.0.0${RESET}"
+echo -e "${GREEN}Веб-интерфейс: http://$SERVER_IP:$PORT/${RESET}"
+echo -e "${GREEN}Gunicorn Binding: 0.0.0.0${RESET}"
 fi
 echo -e "${GREEN}========================================${RESET}"
